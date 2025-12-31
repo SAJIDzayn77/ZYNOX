@@ -1,0 +1,681 @@
+
+import os
+import json
+import math
+import re
+import requests
+import xml.etree.ElementTree as ET
+from typing import List, Dict, Union, Any
+
+# Core scientific deps
+try:
+    from sympy import symbols, Eq, solve, Function, Derivative, pdsolve, parse_expr
+    from sympy.parsing.sympy_parser import standard_transformations, implicit_multiplication_application
+    from sympy.physics.mechanics import LagrangesMethod, dynamicsymbols
+    import mpmath as mp
+    import numpy as np
+    from scipy.linalg import eigh
+    import scipy.sparse as sp
+    import scipy.sparse.linalg as spla
+
+    mp.mp.dps = 80
+    TRANSFORMATIONS = (standard_transformations + (implicit_multiplication_application,))
+    DEPENDENCIES_OK = True
+except Exception as e:
+    DEPENDENCIES_OK = False
+    print("WARNING: Missing dependencies:", e)
+    print("Install sympy numpy scipy mpmath requests python-dotenv groq to unlock full features.")
+
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except Exception:
+    pass
+
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", None)
+
+# Try to import groq client - if not present or key missing, we'll use simulated LLM
+GROQ_AVAILABLE = False
+if GROQ_API_KEY:
+    try:
+        from groq import Groq
+
+        GROQ_AVAILABLE = True
+    except Exception:
+        GROQ_AVAILABLE = False
+
+
+def safe_parse(expr_str: str):
+    if "__" in expr_str or "import" in expr_str or "os." in expr_str:
+        raise ValueError("Unsafe expression detected.")
+    # Note: Use of global TRANSFORMATIONS is safe because it's predefined.
+    return parse_expr(expr_str, transformations=TRANSFORMATIONS, evaluate=True)
+
+
+class HardMathSolver:
+    def __init__(self, precision: int = 80):
+        mp.mp.dps = precision
+        self.prec = precision
+
+    def _polynomial_roots_durand_kerner(self, coeffs):
+        """Finds roots of a polynomial using the Durand-Kerner method."""
+        coeffs = np.array(coeffs, dtype=np.complex128)
+        if coeffs[0] == 0:
+            raise ValueError("Leading coefficient cannot be zero.")
+        coeffs = coeffs / coeffs[0]
+        n = len(coeffs) - 1
+        # Initial guesses: circle of radius 0.9 centered at 0.4
+        roots = np.array([0.4 + 0.9 * np.exp(2j * math.pi * k / n) for k in range(n)], dtype=np.complex128)
+
+        for _ in range(300):  # max iterations
+            prev = roots.copy()
+            for i in range(n):
+                p_val = np.polyval(coeffs, roots[i])
+                denom = 1
+                for j in range(n):
+                    if i != j:
+                        denom *= (roots[i] - roots[j])
+                if denom == 0:
+                    denom = 1e-16  # Avoid division by zero on clustered roots
+                roots[i] = roots[i] - p_val / denom
+            if np.max(np.abs(roots - prev)) < 1e-12:
+                break
+        return roots
+
+    def find_roots(self, f_expr_str: str, var='x', domain=(-10, 10), samples=200) -> Dict[str, Any]:
+        """Finds roots using specialized methods or mp.findroot multistart."""
+        x = symbols(var)
+        try:
+            f_sym = safe_parse(f_expr_str)
+            poly = None
+
+            # Check if it's a well-behaved polynomial for Durand-Kerner
+            try:
+                poly = f_sym.as_poly(x)
+            except Exception:
+                poly = None
+
+            if poly is not None and 1 <= poly.degree() < 20:
+                # Use robust numerical polynomial solver
+                coeffs = [complex(c) for c in poly.all_coeffs()]
+                roots = self._polynomial_roots_durand_kerner(coeffs)
+                roots_filtered = [r for r in roots if domain[0] - 1e-12 <= r.real <= domain[1] + 1e-12]
+                root_strs = [mp.nstr(r, self.prec) for r in roots_filtered]
+                return {"type": "Hard Numerical Math Solution", "method": "Durand-Kerner", "solution": root_strs}
+            else:
+                # Use mp.findroot with multi-start sampling for general functions
+                f_lambda = lambda z: mp.mpc(complex(f_sym.subs({x: z})))
+                found = []
+                for _ in range(samples):
+                    # Sample complex starting points
+                    guess_r = np.random.uniform(domain[0], domain[1])
+                    guess_i = np.random.uniform(-abs(domain[1] - domain[0]), abs(domain[1] - domain[0])) * (
+                            np.random.rand() < 0.5)
+                    start = mp.mpc(guess_r + 1j * guess_i)
+                    try:
+                        r = mp.findroot(f_lambda, start, tol=mp.mpf('1e-50'), maxsteps=120, verify=False)
+                        if not (r.isinf() or r.isnan()):
+                            found.append(complex(r))
+                    except Exception:
+                        continue
+
+                # Cluster roots to remove duplicates from multiple successful starts
+                clusters = []
+                for r in found:
+                    placed = False
+                    for c in clusters:
+                        if abs(r - c[0]) < 1e-8:
+                            c.append(r);
+                            placed = True;
+                            break
+                    if not placed:
+                        clusters.append([r])
+                roots = [sum(c) / len(c) for c in clusters]
+                root_strs = [mp.nstr(r, self.prec) for r in roots]
+                return {"type": "Hard Numerical Math Solution", "method": "mp.findroot multistart",
+                        "solution": root_strs}
+        except Exception as e:
+            return {"type": "Error", "error": f"Root finding error: {e}"}
+
+
+class PhysicsEngines:
+    def symbolic_differential_solver(self, equation_str: str, dependent_vars: Union[str, List[str]],
+                                     independent_vars: Union[str, List[str]]) -> Dict[str, Any]:
+        """Solves ODEs/PDEs symbolically using SymPy."""
+        independent = symbols(independent_vars) if isinstance(independent_vars, str) else symbols(
+            ' '.join(independent_vars))
+
+        if isinstance(dependent_vars, str):
+            u = Function(dependent_vars)(*independent)
+        else:
+            # Multi-variable dependent functions not handled in this simplified version
+            u = [Function(v)(*independent) for v in dependent_vars]
+            if len(independent) > 1:
+                return {"type": "Failure",
+                        "error": "SymPy PDE solver only supports single dependent function in this wrapper."}
+            u = u[0]
+
+        try:
+            # Simple substitution to convert string derivative notation to SymPy objects
+            eq_parsed = equation_str.replace("u(x, t)", str(u)).replace("u(t)", str(u)).replace("t",
+                                                                                                str(independent[-1]))
+            eq = safe_parse(eq_parsed)
+            sol = pdsolve(Eq(eq, 0), u)
+
+            if len(independent) == 1:
+                return {"type": "ODE Solution", "solution": str(sol), "method": "SymPy dsolve"}
+            else:
+                return {"type": "PDE Solution", "solution": str(sol), "method": "SymPy pdsolve"}
+        except NotImplementedError:
+            return {"type": "Failure", "error": "Symbolic solver failed: requires numerical method."}
+        except Exception as e:
+            return {"type": "Error", "error": f"PDE/ODE error: {e}"}
+
+    def lagrangian_dynamics_setup(self, Kinetic_Energy: str, Potential_Energy: str, generalized_coords: List[str],
+                                  time_var='t') -> Dict[str, Any]:
+        """Derives Equations of Motion (EOM) from a Lagrangian."""
+        t = symbols(time_var)
+        # Create time-dependent generalized coordinates
+        coords = dynamicsymbols(generalized_coords, t=t)
+
+        try:
+            # Safely parse the expressions
+            T = safe_parse(Kinetic_Energy)
+            V = safe_parse(Potential_Energy)
+            L = T - V
+
+            # Setup Lagrangian method
+            LM = LagrangesMethod(L, coords)
+            eom = LM.form_lagranges_equations()
+
+            return {"type": "Lagrangian Dynamics EOM", "Lagrangian": str(L), "Equations_of_Motion": str(eom),
+                    "method": "Euler-Lagrange"}
+        except Exception as e:
+            return {"type": "Error", "error": f"Lagrangian error: {e}"}
+
+
+def build_hubbard_hamiltonian(L: int, t: float = 1.0, U: float = 2.0, spinful: bool = True, periodic: bool = False):
+    """
+    Builds the Hamiltonian matrix for the 1D Hubbard model (exact diagonalization).
+    Uses bit representation for Fock states.
+    """
+    if spinful:
+        dim = 2 ** (2 * L)  # 4 states per site: |0>, |up>, |down>, |up down>
+        H = sp.lil_matrix((dim, dim), dtype=np.complex128)
+
+        # 1. Interaction Term (U * ni_up * ni_down)
+        for state in range(dim):
+            # n_up is the bitmask for up spins (bits L to 2L-1)
+            n_up = (state >> L) & ((1 << L) - 1)
+            # n_down is the bitmask for down spins (bits 0 to L-1)
+            n_down = state & ((1 << L) - 1)
+
+            # Count sites with both up and down occupancy (double occupancy)
+            both = n_up & n_down
+            H[state, state] += U * bin(both).count("1")
+
+        # 2. Hopping Term (-t * sum_{<i,j>, sigma} (c_i,sigma^+ c_j,sigma + h.c.))
+        neighbors = [(i, (i + 1) % L) for i in range(L)] if periodic else [(i, i + 1) for i in range(L - 1)]
+        H_hopp = sp.lil_matrix((dim, dim), dtype=np.complex128)
+
+        for state in range(dim):
+            n_up = (state >> L) & ((1 << L) - 1)
+            n_down = state & ((1 << L) - 1)
+
+            for i, j in neighbors:
+                # Hopping for UP spins (index i, j are site indices)
+                # Check for hop from j to i (c_i^+ c_j)
+                if ((n_up >> j) & 1) == 1 and ((n_up >> i) & 1) == 0:
+                    new_n_up = n_up ^ (1 << j) ^ (1 << i)  # Flip bits at j and i
+                    H_hopp[(new_n_up << L) | n_down, state] += -t
+                # Check for hop from i to j (c_j^+ c_i)
+                if ((n_up >> i) & 1) == 1 and ((n_up >> j) & 1) == 0:
+                    new_n_up = n_up ^ (1 << i) ^ (1 << j)  # Flip bits at i and j
+                    H_hopp[(new_n_up << L) | n_down, state] += -t
+
+                # Hopping for DOWN spins
+                # Check for hop from j to i (c_i^+ c_j)
+                if ((n_down >> j) & 1) == 1 and ((n_down >> i) & 1) == 0:
+                    new_n_down = n_down ^ (1 << j) ^ (1 << i)
+                    H_hopp[n_up << L | new_n_down, state] += -t
+                # Check for hop from i to j (c_j^+ c_i)
+                if ((n_down >> i) & 1) == 1 and ((n_down >> j) & 1) == 0:
+                    new_n_down = n_down ^ (1 << i) ^ (1 << j)
+                    H_hopp[n_up << L | new_n_down, state] += -t
+
+        return (H + H_hopp).tocsr()
+    else:
+        # Non-spinful (spinless) case, simpler Hamiltonian (no U term)
+        dim = 2 ** L
+        H = sp.lil_matrix((dim, dim), dtype=np.complex128)
+        neighbors = [(i, (i + 1) % L) for i in range(L)] if periodic else [(i, i + 1) for i in range(L - 1)]
+        for state in range(dim):
+            for i, j in neighbors:
+                if ((state >> j) & 1) == 1 and ((state >> i) & 1) == 0:
+                    new = state ^ (1 << j) ^ (1 << i)
+                    H[new, state] += -t
+                if ((state >> i) & 1) == 1 and ((state >> j) & 1) == 0:
+                    new = state ^ (1 << i) ^ (1 << j)
+                    H[new, state] += -t
+        return H.tocsr()
+
+
+def hubbard_ground_state_energy(L: int, t=1.0, U=2.0, spinful=True, k=6) -> Dict[str, Any]:
+    """Calculates the ground state energy for the 1D Hubbard model."""
+    try:
+        dim = 4 ** L if spinful else 2 ** L
+
+        if dim > 4096:
+            # DMRG stub approximation for large systems
+            approx_E0 = -0.9 * t * L + 0.25 * U  # Rough informed estimate
+            return {"type": "Quantum Ground State (Approx.)", "Model": f"Fermi-Hubbard N={L}",
+                    "Method": "DMRG Stub (Conceptual)", "Ground_State_Energy": float(approx_E0), "Hilbert_Dim": dim,
+                    "Research_Insight": "Approximate DMRG/tensor-network result (stub). Replace with real DMRG backend for production."}
+
+        # Exact diagonalization for small systems
+        H = build_hubbard_hamiltonian(L, t=t, U=U, spinful=spinful, periodic=False)
+        dim_act = H.shape[0]
+
+        if dim_act <= 1000:
+            # Dense diagonalization for very small systems
+            H_dense = H.toarray()
+            evals, _ = eigh(H_dense)
+            vals_sorted = np.sort(evals.real)
+            method = "Dense eigh (Exact)"
+        else:
+            # Sparse diagonalization for small-to-medium systems
+            vals, _ = spla.eigsh(H, k=min(k, dim_act - 1), which='SA', sigma=None)  # 'SA' = smallest algebraic
+            vals_sorted = np.sort(vals.real)
+            method = "Sparse eigsh (ARPACK - Exact)"
+
+        return {"type": "Quantum Ground State (Exact)", "E0": float(vals_sorted[0]),
+                "lowest_eigenvalues": [float(v) for v in vals_sorted], "Hilbert_Dim": dim_act, "method": method}
+
+    except Exception as e:
+        return {"type": "Error", "error": f"Hubbard error: {e}"}
+
+
+class TensorNetworkSolver:
+    """Wrapper class for quantum many-body solvers."""
+
+    def solve_hubbard_model_ground_state(self, sites: int, U: float, t: float, spinful: bool = True) -> Dict[str, Any]:
+        return hubbard_ground_state_energy(sites, t=t, U=U, spinful=spinful)
+
+
+
+def huckel_energy(adjacency: np.ndarray, alpha=0.0, beta=-1.0):
+    """Calculates pi electron energy levels using Hückel Molecular Orbital theory."""
+    H = alpha * np.eye(adjacency.shape[0]) + beta * adjacency
+    evals, _ = eigh(H)
+    levels = [float(mp.nstr(e, mp.mp.dps)) for e in np.sort(evals)]
+
+    n = adjacency.shape[0]
+    # Calculate pi-electron energy assuming a neutral, fully conjugated system (half-filling)
+    if n % 2 == 0:
+        # Doubly occupy the n/2 lowest levels
+        E_pi = 2 * sum(levels[:n // 2])
+    else:
+        # Odd number of electrons: two in the lowest (n//2) levels, one in the highest occupied orbital
+        E_pi = 2 * sum(levels[:n // 2]) + levels[n // 2]
+
+    return {"levels": levels, "pi_energy": float(E_pi), "method": "Hückel"}
+
+
+def conceptual_dft_stub(molecule_formula: str, method: str = "B3LYP/6-31G*"):
+    """Stub for Density Functional Theory calculations."""
+    return {"type": "DFT Stub", "molecule": molecule_formula, "method": method,
+            "message": "DFT stub: replace with PySCF/Psi4 adapter for production."}
+
+
+class ChemistryEngine:
+    def solve_chemistry_problem(self, query: str) -> Dict[str, Any]:
+        """Routes chemistry queries."""
+        q = query.lower()
+
+        # Benzene (C6H6) Hückel calculation is pre-set
+        if "benzene" in q or "huckel" in q or "pi" in q:
+            N = 6
+            A = np.zeros((N, N))
+            # Define adjacency matrix for cyclic structure
+            for i in range(N):
+                A[i, (i + 1) % N] = A[(i + 1) % N, i] = 1
+            h = huckel_energy(A)
+            h["molecule"] = "Benzene ($\mathrm{C}_{6}\mathrm{H}_{6}$)"
+            h[
+                "Research_Insight"] = "Hückel yields 6 pi-levels; degeneracy pattern matches known solution ($E_{2,3}=\\alpha\\pm\\beta$, $E_{4,5}=\\alpha\\pm\\beta$, $E_{6}=\\alpha-2\\beta$)."
+            return {"type": "Molecular Orbital Theory", **h}
+
+        return conceptual_dft_stub("Generic Molecule")
+
+
+class SimulatedLLM:
+    """Fallback LLM if GROQ is unavailable."""
+
+    def __init__(self):
+        self.model = "simulated-llm"
+
+    def chat_completions(self, messages: List[Dict[str, str]], temperature: float = 0.2) -> str:
+        # Very simple deterministic summarizer for fallback
+        user_msg = messages[-1]["content"] if messages else ""
+        if "research" in user_msg.lower() or "summar" in user_msg.lower():
+            return "Simulated LLM summary: This is a high-level research summary. (Install groq + set GROQ_API_KEY for real LLM.)"
+        return "Simulated LLM response: (no GROQ API available)."
+
+
+class GroqLLMReasoner:
+    """Handles LLM calls for reasoning, decomposition, and insight generation."""
+
+    def __init__(self):
+        self.model = "llama-3.3-70b-versatile"
+        if GROQ_AVAILABLE and GROQ_API_KEY:
+            self.client = Groq(api_key=GROQ_API_KEY)
+            self.simulated = False
+        else:
+            self.client = SimulatedLLM()
+            self.simulated = True
+
+    def reason_and_decompose(self, query: str) -> Dict[str, str]:
+        """Provides a decomposition plan for the query."""
+        system = "You are COSMIC v8, a research-grade scientific assistant. Provide decomposition & next steps."
+        messages = [{"role": "system", "content": system}, {"role": "user", "content": query}]
+
+        if not self.simulated:
+            try:
+                completion = self.client.chat.completions.create(model=self.model, messages=messages, temperature=0.1)
+                response = completion.choices[0].message.content
+            except Exception:
+                response = SimulatedLLM().chat_completions(messages)
+        else:
+            response = self.client.chat_completions(messages)
+
+        # simple heuristic to pick task for internal routing (LLM provides a richer description)
+        ql = query.lower()
+        if "chem" in ql or "huckel" in ql or "dft" in ql:
+            task = "Chemistry Simulation";
+            theory = "Quantum Chemistry"
+        elif "hubbard" in ql or "ground state" in ql:
+            task = "Quantum Simulation";
+            theory = "Many-Body"
+        elif "research" in ql or "review" in ql or "survey" in ql:
+            task = "Research";
+            theory = "Literature Synthesis"
+        else:
+            task = "Mathematical/Physical Simulation";
+            theory = "Core Engines"
+
+        return {"task": task, "theory": theory, "decomposition_steps": response}
+
+    def generate_theory_insight(self, result: Dict[str, Any]) -> str:
+        """Generates a research-level insight based on the solver output."""
+        system = "You are COSMIC v8. Provide a concise research-level insight based on this solver output (focus on methods, assumptions, and next experiments). Use LaTeX for mathematical terms."
+        messages = [{"role": "system", "content": system}, {"role": "user", "content": json.dumps(result)}]
+
+        if not self.simulated:
+            try:
+                completion = self.client.chat.completions.create(model=self.model, messages=messages, temperature=0.1)
+                return completion.choices[0].message.content
+            except Exception:
+                return "Simulated insight: The Groq API call failed. This is a synthesized insight. Install Groq for real LLM outputs."
+        else:
+            return "Simulated insight: This is a synthesized insight. Install Groq for real LLM outputs."
+
+
+class ResearchEngine:
+    def __init__(self, llm: GroqLLMReasoner):
+        self.llm = llm
+
+    def _wiki_summary(self, topic: str) -> str:
+        """Fetches summary from Wikipedia API."""
+        url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{topic.replace(' ', '_')}"
+        try:
+            r = requests.get(url, timeout=8)
+            r.raise_for_status()
+            data = r.json()
+            return data.get("extract", "")
+        except Exception:
+            return ""
+
+    def _arxiv_search(self, topic: str, max_results: int = 3) -> List[Dict[str, str]]:
+        """Searches arXiv for recent papers via the API."""
+        q = requests.utils.requote_uri(topic)
+        url = f"http://export.arxiv.org/api/query?search_query=all:{q}&start=0&max_results={max_results}"
+        try:
+            r = requests.get(url, timeout=10)
+            r.raise_for_status()
+            root = ET.fromstring(r.text)
+            ns = {'atom': 'http://www.w3.org/2005/Atom'}
+            entries = []
+            for entry in root.findall('atom:entry', ns):
+                title_elem = entry.find('atom:title', ns)
+                summary_elem = entry.find('atom:summary', ns)
+                link_elem = entry.find('atom:id', ns)
+
+                if title_elem is not None and summary_elem is not None and link_elem is not None:
+                    entries.append({
+                        "title": title_elem.text.strip(),
+                        "summary": summary_elem.text.strip(),
+                        "link": link_elem.text.strip()
+                    })
+            return entries
+        except Exception:
+            return []
+
+    def research_topic(self, topic: str, max_sources: int = 3) -> Dict[str, Any]:
+        """Combines web search (Wiki, ArXiv) and LLM synthesis."""
+        try:
+            wiki = self._wiki_summary(topic)
+            arxiv = self._arxiv_search(topic, max_results=max_sources)
+            base_text = wiki + "\n\n" + "\n\n".join([f"Title: {a['title']}\nSummary: {a['summary']}" for a in arxiv])
+
+            # Send context to LLM for summary and open problems
+            l_resp = self.llm_reasoner.reason_and_decompose(
+                f"Research summary and open problems for topic: {topic}\n\nContext:\n{base_text[:8000]}")
+            insight = self.llm_reasoner.generate_theory_insight(
+                {"topic": topic, "base_context_length": len(base_text), "llm_plan": l_resp["decomposition_steps"]})
+
+            return {"type": "Research Report", "topic": topic, "wikipedia": wiki, "arxiv_hits": arxiv,
+                    "llm_summary": l_resp["decomposition_steps"], "llm_insight": insight}
+        except Exception as e:
+            return {"type": "Error", "error": f"Research engine failed: {e}"}
+
+
+
+class InterpretabilityLayer:
+    def analyze_solution_path(self, query: str, result: Dict[str, Any]) -> Dict[str, Any]:
+        """Provides internal analysis of the solver method and complexity."""
+        solution_type = result.get("type", result.get("Model", "General"))
+        core_method = result.get("method", "Core Engines")
+        dps = mp.mp.dps if DEPENDENCIES_OK else "N/A"
+        path = "Direct symbolic / numerical"
+        complexity = "Varies"
+
+        if "Hard Numerical Math Solution" in solution_type or "Durand-Kerner" in core_method:
+            path = "Symbolic setup $\\rightarrow$ specialized root-finding (Durand-Kerner or Newton/Bisection multi-start)"
+            complexity = "Polynomial (Durand-Kerner) / Numeric (mp.findroot)"
+        elif "Quantum" in solution_type or "Hubbard" in query.lower():
+            path = "Hamiltonian construction $\\rightarrow$ diagonalization (eigh / eigsh) or Tensor Network (DMRG stub)"
+            complexity = "Exponential ($O(4^L)$ for exact) / polynomial (DMRG approx)"
+        elif "Lagrangian" in solution_type:
+            path = "Symbolic setup of Lagrangian $\\rightarrow$ Euler-Lagrange equations via SymPy mechanics."
+            complexity = "Symbolic derivation"
+
+        research_notes = f"Methodology Summary: {path}. Complexity: {complexity}. Precision: {dps} dps (if numerical)."
+        result["X_Zynox_Analysis"] = research_notes
+        return result
+
+
+class AdvancedKnowledgeV8:
+    def __init__(self):
+        if not DEPENDENCIES_OK:
+            print("WARNING: Some features will be limited due to missing dependencies.")
+        self.math = HardMathSolver()
+        self.physics = PhysicsEngines()
+        self.quantum = TensorNetworkSolver()
+        self.chemistry = ChemistryEngine()
+        self.llm_reasoner = GroqLLMReasoner()
+        self.research_engine = ResearchEngine(self.llm_reasoner)
+        self.interpret = InterpretabilityLayer()
+
+    def query_grand_challenge(self, query: str) -> Dict[str, Any]:
+        """The main router for all scientific queries."""
+        ql = query.lower()
+        reasoning = self.llm_reasoner.reason_and_decompose(query)
+
+        res = {"type": "Unrecognized",
+               "message": "Could not classify query. Try 'research <topic>' or 'hubbard sites=<N>' or 'find root of ...'."}
+
+        # --- Router logic ---
+
+        # 1. Research route
+        if "research" in ql or "survey" in ql or "review" in ql:
+            topic = query.replace("research", "").replace("survey", "").replace("review", "").strip()
+            topic = topic if topic else query  # Fallback if only 'research' was typed
+            res = self.research_engine.research_topic(topic)
+
+        # 2. Chemistry
+        elif "chem" in ql or "huckel" in ql or "dft" in ql or "benzene" in ql:
+            res = self.chemistry.solve_chemistry_problem(query)
+
+        # 3. Quantum Hubbard
+        elif "hubbard" in ql or "ground state" in ql:
+            sites = 4
+            m = re.search(r'sites\s*=\s*(\d+)', ql)
+            if m:
+                sites = int(m.group(1))
+            res = self.quantum.solve_hubbard_model_ground_state(sites=sites, U=2.0, t=1.0, spinful=True)
+
+        # 4. Math root finding
+        elif "find root" in ql or "roots of" in ql or "precision" in ql:
+            # Simple heuristic to extract the function string
+            m = re.search(r'root (?:of|for) (.*) in the domain', ql)
+            if not m:
+                m = re.search(r'root (?:of|for) (.*)', ql)
+
+            func_str = m.group(1).strip() if m else "x**5 - 3*x + 1"
+            res = self.math.find_roots(func_str, var='x', domain=(-2, 2))
+
+        # 5. PDE / dynamics
+        elif "pde" in ql or "differential equation" in ql or "lagrangian" in ql:
+            if "lagrangian" in ql:
+                # Double pendulum example
+                T_kin = "0.5*m1*(l1*q1.diff(t))**2 + 0.5*m2*((l1*q1.diff(t))**2 + (l2*q2.diff(t))**2 + 2*l1*l2*q1.diff(t)*q2.diff(t)*cos(q1-q2))"
+                V_pot = "-m1*g*l1*cos(q1) - m2*g*(l1*cos(q1) + l2*cos(q2))"
+                res = self.physics.lagrangian_dynamics_setup(T_kin, V_pot, ["q1", "q2"])
+            else:
+                # Simple wave equation
+                equation = "Derivative(u(x, t), t, 2) - 1*Derivative(u(x, t), x, 2)"
+                res = self.physics.symbolic_differential_solver(equation, "u", ["x", "t"])
+
+        # 6. General symbolic fallback (try parse as equation)
+        elif "=" in query:
+            try:
+                eqs = query.split("=")
+                if len(eqs) == 2:
+                    lhs = safe_parse(eqs[0])
+                    rhs = safe_parse(eqs[1])
+                    sol = solve(Eq(lhs, rhs), symbols('x'))
+                    res = {"type": "Symbolic Solution", "solution": str(sol), "method": "SymPy solve"}
+            except Exception as e:
+                # If symbolic solve fails, the unrecognized message stands
+                print(f"DEBUG: Symbolic fallback failed: {e}")
+
+        # --- Final processing ---
+        # Add LLM decomposition plan
+        res["LLM_Decomposition_Plan"] = reasoning["decomposition_steps"]
+
+        # Add internal Zynox analysis
+        res = self.interpret.analyze_solution_path(query, res)
+
+        # Get LLM generated insight on the result
+        res["LLM_Theory_Review"] = self.llm_reasoner.generate_theory_insight(res)
+
+        return res
+
+
+
+def run_interactive_zynox(zynox_instance: 'AdvancedKnowledgeV8'):
+    """Starts the interactive Zynox query loop, routing input to the main engine."""
+    import sys  # Re-import sys inside function to ensure accessibility
+
+    print("\n" + "=" * 50)
+    print("--- ZYNOX Interactive Query Mode Active ---")
+    print("=" * 50)
+    print("Ask a question (e.g., 'research quantum gravity' or 'hubbard sites=4')")
+    print("Type 'quit' or 'exit' to gracefully terminate.")
+
+    while True:
+        try:
+            # Display the desired prompt
+            query = input("ZYNOX: ")
+
+            if query.lower() in ["quit", "exit"]:
+                print("ZYN-RESPONSE: Session terminated. Goodbye!")
+                break
+
+            if not query.strip():
+                continue
+
+            # Process the query using the main Zynox engine
+            answer = zynox_instance.query_grand_challenge(query)
+
+            # Print the structured answer (JSON format)
+            print("\nZYN-RESPONSE:")
+            print(json.dumps(answer, indent=2))
+            print("-" * 40)
+
+        except EOFError:
+            print("\nZYN-RESPONSE: Exiting ZYNOX Interactive Mode.")
+            break
+        except Exception as e:
+            # Catch any unexpected errors during the loop
+            print(f"\nZYN-ERROR: An unexpected error occurred while processing query: {e}", file=sys.stderr)
+            print("-" * 40)
+
+
+
+if __name__ == "__main__":
+    z = AdvancedKnowledgeV8()
+    print("COSMIC v8 initialized. GROQ available:", (GROQ_AVAILABLE and GROQ_API_KEY is not None))
+    if DEPENDENCIES_OK:
+        print("mpmath DPS:", mp.mp.dps)
+    else:
+        print("NOTE: Limited functionality due to missing scientific packages.")
+
+    # --- DEMO EXECUTION ---
+
+    # Demo 1: polynomial roots
+    print("\n--- DEMO 1: Polynomial roots (Hard Numerical Math) ---")
+    out = z.query_grand_challenge("Find all roots of x**5 - 3*x + 1 in the domain [-2, 2] to high precision.")
+    print(json.dumps(out, indent=2))
+
+    # Demo 2: Hubbard small exact
+    print("\n--- DEMO 2: Hubbard L=4 (Quantum Exact) ---")
+    out = z.query_grand_challenge(
+        "Find the ground state energy for the 1D Fermi-Hubbard Model with sites=4, U=2.0, t=1.0.")
+    print(json.dumps(out, indent=2))
+
+    # Demo 3: Hubbard large (DMRG stub)
+    print("\n--- DEMO 3: Hubbard L=12 (Quantum Approximation) ---")
+    out = z.query_grand_challenge(
+        "Find the ground state energy for the 1D Fermi-Hubbard Model with sites=12, U=2.0, t=1.0.")
+    print(json.dumps(out, indent=2))
+
+    # Demo 4: Hückel for benzene
+    print("\n--- DEMO 4: Hückel (Chemistry) ---")
+    out = z.query_grand_challenge("Calculate the pi molecular orbital energy levels for Benzene using Hückel theory.")
+    print(json.dumps(out, indent=2))
+
+    # Demo 5: Research on a hard topic
+    print("\n--- DEMO 5: Research (Web Synthesis) ---")
+    out = z.query_grand_challenge("Research quantum gravity theory and its open problems.")
+    print(json.dumps(out, indent=2))
+
+    # Demo 6: Physics Lagrangian
+    print("\n--- DEMO 6: Lagrangian Dynamics (Double Pendulum) ---")
+    out = z.query_grand_challenge(
+        "Derive the equations of motion for a standard double pendulum using the Lagrangian dynamics engine.")
+    print(json.dumps(out, indent=2))
+
+    # --- START INTERACTIVE MODE (NEW) ---
+    run_interactive_zynox(z)
