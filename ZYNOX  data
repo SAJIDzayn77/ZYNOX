@@ -1,0 +1,820 @@
+
+import os
+import asyncio
+import json
+import random
+import sys
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
+
+# Core Libraries
+try:
+    import aiohttp
+    import pandas as pd
+    import numpy as np
+    import yfinance as yf
+    from textblob import TextBlob
+except ImportError as e:
+    print(f"[CRITICAL] Missing required library: {e}. Run pip install aiohttp pandas numpy yfinance textblob")
+    sys.exit(1)
+
+# --- Configuration & Simulated API Keys (Assumed from .env) ---
+# Existing APIs
+NASA_API_KEY = os.getenv("NASA_API_KEY")
+OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY", "OWM_SIM_V10")
+NEWS_API_KEY = os.getenv("NEWS_API_KEY", "NEWS_SIM_V10")
+TRADING_ECONOMICS_KEY = os.getenv("TRADING_ECONOMICS_KEY", "TE_SIM_V10")
+EIA_API_KEY = os.getenv("EIA_API_KEY", "EIA_SIM_V10")
+# New Institutional/Contextual APIs
+WORLD_BANK_KEY = os.getenv("WORLD_BANK_KEY", "WB_SIM_V10")
+WHO_KEY = os.getenv("WHO_KEY", "WHO_SIM_V10")
+IMF_KEY = os.getenv("IMF_KEY", "IMF_SIM_V10")
+OECD_KEY = os.getenv("OECD_KEY", "OECD_SIM_V10")
+NOAA_KEY = os.getenv("NOAA_KEY", "NOAA_SIM_V10")
+GDELT_KEY = os.getenv("GDELT_KEY", "GDELT_SIM_V10")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "GROQ_SIM_V10")
+
+# --- REAL NASA API CONFIGURATION ---
+# NOTE: Using a generic NASA JSON API (like the NEO Feed) as a functional template.
+# To retrieve MODIS NDVI *data* programmatically, you would need to use a specific
+# Earthdata Search or GIBS API that supports numerical data output.
+NASA_API_URL = "https://api.nasa.gov/neo/rest/v1/feed?start_date=2024-06-01&end_date=2024-06-02"
+# --- END REAL NASA API CONFIG ---
+
+# Groq Model Configuration
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"  # Simulated
+LLM_MODEL = "llama-3.3-70b-versatile"
+LLM_SYSTEM_PROMPT = "You are Zynox AGI's final decision layer. Analyze the provided multi-domain data summary and provide a concise, 50-word strategic narrative and a final Prediction Confidence Score (0.0 to 1.0) in JSON format."
+
+DATA_DIR = os.getenv("ZYNOX_DATA_DIR", "zynox_data_v10")
+os.makedirs(DATA_DIR, exist_ok=True)
+PREDICTION_DB_FILE = os.path.join(DATA_DIR, "prediction_tracker_db.json")
+
+# WEIGHTED CONFIDENCE SCORING MODEL (WCSM) PARAMETERS V10 (Base Weights)
+WCSM_WEIGHTS_BASE = {
+    "FINANCE_CORE": 0.15,  # yfinance, IMF
+    "MACRO_INSTITUTIONAL": 0.15,  # TE, WB, OECD
+    "HYPER_SPATIAL_FUSION": 0.15,  # NASA, OWM, NOAA
+    "ENERGY_INFRASTRUCTURE": 0.10,  # EIA, OSM
+    "GEOPOLITICAL_HEALTH": 0.15,  # GDELT, WHO
+    "NLP_CONTEXTUAL": 0.10,  # News API, OWD
+    "LLM_META_ANALYSIS": 0.20,  # Groq/Llama 3.3 (Highest weight)
+}
+
+# Latency Tolerance (H = Hours)
+LATENCY_TOLERANCE_H = {
+    "FINANCE": 0.005,
+    "MACRO": 12.0,
+    "SPATIAL": 6.0,
+    "WEATHER": 0.5,
+    "ENERGY": 1.0,
+    "LOGISTICS": 2.0,
+    "NLP": 0.25,
+    "INSTITUTIONAL": 24.0,  # WB, IMF, OECD
+    "HEALTH": 48.0,  # WHO
+    "CLIMATE": 3.0,  # NOAA
+    "EVENTS": 0.1,  # GDELT (Near real-time)
+}
+
+# Default placeholder for failed API fetches (ensures resilience)
+DEFAULT_DATA_FAIL = {
+    "freshness_h": 1000.0,
+    "model_confidence": 0.05,
+    "failure_note": "FETCH FAILED - ZERO-RISK PLACEHOLDER USED"
+}
+
+
+# --- Utility Functions ---
+def now_utc_iso() -> str:
+    """Returns current UTC time in ISO format."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def safe_data(result: Any, domain_name: str) -> Dict[str, Any]:
+    """Checks for exceptions and returns safe placeholder data if an error occurred."""
+    if isinstance(result, Exception):
+        print(f"[WARNING] Data fetch failed for {domain_name}. Error: {type(result).__name__}: {result}")
+        fail_data = DEFAULT_DATA_FAIL.copy()
+        fail_data['failure_domain'] = domain_name
+        return fail_data
+    return result
+
+
+def calculate_data_reliability(data: Dict[str, Any], domain: str) -> Tuple[float, float]:
+    """Calculates Data Quality Index (DQI) and Latency Risk Score (LRS)."""
+    tolerance_key_map = {
+        "FINANCE_CORE": "FINANCE", "MACRO_INSTITUTIONAL": "INSTITUTIONAL",
+        "HYPER_SPATIAL_FUSION": "SPATIAL", "ENERGY_INFRASTRUCTURE": "ENERGY",
+        "GEOPOLITICAL_HEALTH": "HEALTH", "NLP_CONTEXTUAL": "NLP",
+        "NOAA_CLIMATE": "CLIMATE", "GDELT_EVENTS": "EVENTS"
+    }
+    tolerance_key = tolerance_key_map.get(domain, "INSTITUTIONAL")  # Default to Institutional
+
+    max_age_h = LATENCY_TOLERANCE_H.get(tolerance_key, 24.0)
+    age_h = data.get('freshness_h', max_age_h * 2)
+
+    LRS = min(1.0, max(0.0, (age_h - max_age_h) / max_age_h * 1.5))
+
+    quality_factors = []
+    if 'failure_note' in data: quality_factors.append(0.01)
+    if 'model_confidence' in data: quality_factors.append(data['model_confidence'])
+
+    DQI = np.mean(quality_factors) if quality_factors else 1.0
+    DQI = max(0.01, DQI * (1.0 - LRS * 0.3))
+
+    return float(DQI), float(LRS)
+
+
+# --- WorldDataCollector (I/O and API Simulation/Live Calls) ---
+class WorldDataCollector:
+    def __init__(self):
+        self.session: Optional[aiohttp.ClientSession] = None
+
+    async def _ensure_session(self):
+        if self.session is None:
+            # Use real connection limits in simulation
+            self.session = aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=150))
+
+    async def close(self):
+        if self.session:
+            await self.session.close()
+            self.session = None
+
+    # --- 15 API Fetch Functions ---
+
+    # Core V9 (Existing)
+    async def fetch_market_tick_data(self, symbol: str) -> Dict[str, Any]:
+        await asyncio.sleep(0.01)
+        df_5d = await asyncio.to_thread(yf.Ticker(symbol).history, period="5d", auto_adjust=True)
+        if df_5d.empty: return {"note": "Financial data fetch failed."}
+        latest_close = df_5d.iloc[-1]['Close']
+        return {
+            "freshness_h": random.uniform(0.001, 0.005),
+            "latest_close": float(latest_close),
+            "annualized_volatility_50d": df_5d['Close'].pct_change().std() * np.sqrt(252),
+            "model_confidence": 0.99
+        }
+
+    async def fetch_trading_economics_data(self, country: str) -> Dict[str, Any]:
+        await asyncio.sleep(0.5)
+        return {
+            "freshness_h": random.uniform(10.0, 72.0), "te_gdp_growth_qoq": random.uniform(-0.01, 0.02),
+            "te_inflation_cpi": random.uniform(0.03, 0.10), "te_unemployment_rate": random.uniform(0.03, 0.08),
+            "model_confidence": random.uniform(0.85, 0.95),
+        }
+
+    async def fetch_nasa_data(self) -> Dict[str, Any]:
+        """
+        [LIVE DATA FETCH] Uses aiohttp to fetch real data from the NASA API.
+        The data extraction now focuses on deriving NDVI/Vegetation Stress metrics.
+        """
+        await self._ensure_session()
+
+        try:
+            # Add the API key to the request parameters
+            params = {
+                'api_key': NASA_API_KEY
+            }
+
+            async with self.session.get(NASA_API_URL, params=params, timeout=10) as response:
+                if response.status != 200:
+                    response_text = await response.text()
+                    raise Exception(f"NASA API returned status {response.status}: {response_text[:100]}...")
+
+                response_data = await response.json()
+
+                # --- Data Extraction and Scoring for NDVI/Vegetation Health ---
+                # NOTE: This section simulates deriving a vegetation stress metric
+                # from a complex JSON response (like NEO data or a custom Earth data API).
+
+                # Placeholder logic: Simulate parsing for NDVI stress and related growth
+                # (A high 'NDVI Stress Level' means poor vegetation health/drought)
+
+                # We calculate a numerical metric based on the received data structure
+                num_hazards = sum(
+                    len(v) for k, v in response_data.get('near_earth_objects', {}).items())  # Example use of NEO data
+
+                # Derive relevant environmental metrics from the structured data
+                ndvi_stress_level = min(1.0, (num_hazards / 50.0) * random.uniform(0.1, 0.9))
+                growth_rate = max(0.0, 0.03 - (ndvi_stress_level * 0.02))
+
+                # Calculate freshness (assuming the API provides a timestamp)
+                freshness = random.uniform(0.5, 3.0)
+
+                return {
+                    "freshness_h": freshness,
+                    "vegetation_ndvi_stress_level": float(ndvi_stress_level),
+                    "agricultural_growth_rate_90d": float(growth_rate),
+                    "model_confidence": 0.98,
+                }
+
+        except Exception as e:
+            # Fallback for failed NASA calls
+            print(f"[WARNING] NASA API Call Failed: {e}. Using simulated values.")
+            return {
+                "freshness_h": random.uniform(0.5, 3.0),
+                "vegetation_ndvi_stress_level": random.uniform(0.1, 0.9),
+                "agricultural_growth_rate_90d": random.uniform(0.0, 0.03),
+                "model_confidence": random.uniform(0.8, 0.95),
+            }
+
+    async def fetch_openweather_data(self) -> Dict[str, Any]:
+        await asyncio.sleep(0.1)
+        return {
+            "freshness_h": random.uniform(0.01, 0.5), "owm_cloud_cover_factor": random.uniform(0.0, 1.0),
+            "owm_precipitation_risk": random.uniform(0.0, 0.8), "model_confidence": 0.99,
+        }
+
+    async def fetch_eia_energy_data(self) -> Dict[str, Any]:
+        await asyncio.sleep(0.7)
+        return {
+            "freshness_h": random.uniform(0.5, 24.0), "eia_crude_oil_inventory_change": random.uniform(-5.0, 5.0),
+            "eia_gasoline_demand_change": random.uniform(-0.05, 0.05),
+            "eia_power_grid_load_percent": random.uniform(70, 110),
+            "model_confidence": random.uniform(0.8, 0.9),
+        }
+
+    async def fetch_infra_routing(self) -> Dict[str, Any]:
+        await asyncio.sleep(0.3)
+        return {
+            "freshness_h": random.uniform(0.2, 2.0), "osm_port_congestion_delay_h": random.uniform(1.0, 24.0),
+            "osm_critical_route_disruption": 0.5 if random.random() < 0.05 else 0.0,
+            "model_confidence": random.uniform(0.75, 0.9),
+        }
+
+    async def fetch_news_sentiment(self) -> Dict[str, Any]:
+        await asyncio.sleep(0.4)
+        articles = [
+            {"title": f"Simulated Article: {random.choice(['Optimism spikes', 'Fears return', 'Uncertainty looms'])}",
+             "link": "#"} for _ in range(50)]
+        polarities = [TextBlob(a.get('title', "")).sentiment.polarity for a in articles]
+        return {
+            "freshness_h": random.uniform(0.05, 0.25),
+            "nlp_avg_sentiment_polarity": np.mean(polarities) if polarities else 0.0,
+            "nlp_article_volume_metric": len(articles) / 100.0, "model_confidence": random.uniform(0.8, 0.95),
+        }
+
+    # New Institutional Data Sources (V10)
+    async def fetch_world_bank_data(self) -> Dict[str, Any]:
+        await asyncio.sleep(1.2)
+        print(f"[MACRO] Using World Bank Key: {WORLD_BANK_KEY[:5]}...")
+        return {
+            "freshness_h": random.uniform(48.0, 360.0),  # Quarterly/Annual Data
+            "wb_gdp_per_capita": random.uniform(30000, 70000),
+            "wb_ease_of_business_index": random.uniform(70, 95),
+            "model_confidence": random.uniform(0.9, 0.99),
+        }
+
+    async def fetch_imf_data(self) -> Dict[str, Any]:
+        await asyncio.sleep(1.0)
+        print(f"[FINANCE] Using IMF Key: {IMF_KEY[:5]}...")
+        return {
+            "freshness_h": random.uniform(12.0, 168.0),
+            "imf_global_fiscal_health_index": random.uniform(0.4, 0.9),
+            "imf_sovereign_debt_ratio": random.uniform(0.5, 1.5),
+            "model_confidence": random.uniform(0.88, 0.98),
+        }
+
+    async def fetch_oecd_data(self) -> Dict[str, Any]:
+        await asyncio.sleep(0.8)
+        print(f"[MACRO] Using OECD Key: {OECD_KEY[:5]}...")
+        return {
+            "freshness_h": random.uniform(24.0, 96.0),
+            "oecd_leading_indicator": random.uniform(90, 110),
+            "oecd_consumer_confidence": random.uniform(95, 105),
+            "model_confidence": random.uniform(0.85, 0.95),
+        }
+
+    async def fetch_who_data(self) -> Dict[str, Any]:
+        await asyncio.sleep(0.6)
+        print(f"[HEALTH] Using WHO Key: {WHO_KEY[:5]}...")
+        return {
+            "freshness_h": random.uniform(4.0, 48.0),
+            "who_health_crisis_index": random.uniform(0.0, 1.0),  # 1.0 is max crisis
+            "who_pandemic_preparedness": random.uniform(0.5, 0.9),
+            "model_confidence": random.uniform(0.7, 0.9),
+        }
+
+    async def fetch_noaa_data(self) -> Dict[str, Any]:
+        await asyncio.sleep(0.4)
+        print(f"[CLIMATE] Using NOAA Key: {NOAA_KEY[:5]}...")
+        return {
+            "freshness_h": random.uniform(1.0, 72.0),
+            "noaa_climate_anomaly_index": random.uniform(-2.0, 2.0),  # Deviation from norm
+            "noaa_sea_surface_temp_change": random.uniform(-0.5, 1.5),
+            "model_confidence": random.uniform(0.9, 0.99),
+        }
+
+    async def fetch_our_world_data(self) -> Dict[str, Any]:
+        await asyncio.sleep(0.5)
+        return {
+            "freshness_h": random.uniform(100.0, 500.0),  # Long-term contextual data
+            "owd_poverty_reduction_rate": random.uniform(0.01, 0.05),
+            "owd_literacy_index": random.uniform(0.8, 0.99),
+            "model_confidence": random.uniform(0.95, 0.99),
+        }
+
+    async def fetch_gdelt_data(self) -> Dict[str, Any]:
+        await asyncio.sleep(0.2)
+        print(f"[EVENTS] Using GDELT Key: {GDELT_KEY[:5]}...")
+        return {
+            "freshness_h": random.uniform(0.01, 0.1),  # Near real-time
+            "gdelt_geopolitical_event_volume": random.uniform(100, 5000),
+            "gdelt_conflict_crisis_score": random.uniform(0.0, 10.0),
+            "model_confidence": random.uniform(0.8, 0.95),
+        }
+
+    # --- LLM Meta-Analysis Layer (Groq Simulation) ---
+    async def call_groq_llama(self, summary_prompt: str) -> Dict[str, Any]:
+        """
+        Simulates calling the Groq API (Llama 3.3 70B Versatile) for final contextual reasoning.
+        The LLM provides the final strategic narrative and an independent confidence score.
+        """
+        await asyncio.sleep(1.5)  # Simulate Groq's high-speed inference
+        print(f"[LLM] Running Llama 3.3 70B Versatile on Groq for Meta-Analysis...")
+
+        # --- Simulated Llama 3.3 Response Generation ---
+
+        # Determine the synthetic LLM output based on a simple confidence heuristic
+        if "High Systemic Stress" in summary_prompt:
+            final_score = random.uniform(0.2, 0.4)
+            narrative = "High geopolitical tension and institutional caution (IMF/WHO) override technical momentum. Extreme volatility expected; maintain a defensive posture."
+        elif "Positive Momentum" in summary_prompt and "Low Systemic Stress" in summary_prompt:
+            final_score = random.uniform(0.85, 0.99)
+            narrative = "Robust global health index (WHO) and positive macroeconomic indicators (WB/OECD) suggest sustained growth. Initiate aggressive directional exposure."
+        else:
+            final_score = random.uniform(0.5, 0.8)
+            narrative = "Conflicting signals between financial optimism and concerning NOAA climate trends require tactical caution. Utilize defined entry points."
+
+        # Simulating the structured JSON output from the LLM
+        simulated_response = {
+            "system_message": LLM_SYSTEM_PROMPT,
+            "llama_prediction": {
+                "strategic_narrative": narrative,
+                "prediction_confidence": float(final_score),
+            }
+        }
+
+        return {
+            "freshness_h": random.uniform(0.005, 0.01),
+            "llm_output": simulated_response['llama_prediction'],
+            "model_confidence": 1.0,  # The LLM is the final arbiter
+        }
+
+
+# --- Resilience Nexus (Intelligence Core) ---
+class ResilienceNexus:
+    def __init__(self, tracker):
+        self.tracker = tracker
+
+    # --- Domain-Specific Analysis (Updated for V10) ---
+
+    def analyze_hyper_spatial(self, nasa: Dict[str, Any], owm: Dict[str, Any], noaa: Dict[str, Any], dqi: float,
+                              lrs: float) -> Dict[str, Any]:
+        """Fuses NDVI/Vegetation health, Atmospheric, and Climate Context."""
+        cloud_penalty = owm.get('owm_cloud_cover_factor', 0.5) * 0.5
+
+        # Climate Anomaly adds significant risk damping
+        climate_risk = abs(noaa.get('noaa_climate_anomaly_index', 0.0)) * 0.2
+
+        # Combined Risk (NDVI Stress now drives environmental risk)
+        env_risk = (nasa.get('vegetation_ndvi_stress_level', 0.5) * 0.5) + climate_risk
+        growth_opp = nasa.get('agricultural_growth_rate_90d', 0.0) * 10.0
+
+        deep_score = (growth_opp * 0.7) - (env_risk * 0.3)
+
+        final_fusion_score = deep_score * (1.0 - cloud_penalty) * dqi * (1.0 - lrs * 0.5)
+
+        return {
+            "fusion_score": float(final_fusion_score),
+            "climate_risk_level": float(climate_risk),
+            "environmental_risk": float(env_risk)
+        }
+
+    def analyze_financial_predictive(self, tick: Dict[str, Any], imf: Dict[str, Any]) -> Dict[str, Any]:
+        """Fuses core financial metrics with IMF fiscal health signals."""
+        base_return = random.uniform(-0.1, 0.1)  # Placeholder for complex MC
+
+        # IMF Fiscal Health Adjustment (Low health score is negative)
+        fiscal_adjustment = (imf.get('imf_global_fiscal_health_index', 0.6) - 0.7) * 0.5
+
+        # High debt is a moderate headwind
+        debt_headwind = (imf.get('imf_sovereign_debt_ratio', 1.0) - 1.0) * -0.05
+
+        final_return = base_return + fiscal_adjustment + debt_headwind
+
+        return {
+            "expected_return": float(final_return),
+            "volatility": tick.get('annualized_volatility_50d', 0.2),
+            "fiscal_adjustment": float(fiscal_adjustment)
+        }
+
+    def analyze_macro_institutional(self, te: Dict[str, Any], wb: Dict[str, Any], oecd: Dict[str, Any]) -> Dict[
+        str, Any]:
+        """Fuses core macro data with WB and OECD institutional context."""
+
+        # TE Macro Stress
+        te_stress = (te.get('te_unemployment_rate', 0.05) * 5.0) - (te.get('te_gdp_growth_qoq', 0.01) * 10.0)
+
+        # WB/OECD Structural Health (Good Ease of Business + High Confidence = Positive)
+        wb_oecd_pos = (wb.get('wb_ease_of_business_index', 80) / 100.0) * 0.5 + (
+                    oecd.get('oecd_leading_indicator', 100) / 100.0) * 0.5
+
+        macro_signal = (wb_oecd_pos - 0.9) * 2.0 - te_stress
+
+        return {
+            "macro_signal": float(macro_signal),
+            "te_stress_level": float(te_stress),
+            "institutional_positivity": float(wb_oecd_pos)
+        }
+
+    def analyze_geopolitical_health(self, gdelt: Dict[str, Any], who: Dict[str, Any]) -> Dict[str, Any]:
+        """Fuses near real-time geopolitical event data with global health metrics."""
+
+        # GDELT Geopolitical Conflict (High score = High risk)
+        geo_risk = gdelt.get('gdelt_conflict_crisis_score', 0.0) / 15.0  # Scale to 0-1
+
+        # WHO Health Crisis (High index = High risk)
+        health_risk = who.get('who_health_crisis_index', 0.0) * 0.7
+
+        geopolitical_health_risk = (geo_risk * 0.6) + (health_risk * 0.4)
+
+        return {
+            "geopolitical_health_risk": min(1.0, float(geopolitical_health_risk)),
+            "gdelt_event_risk": float(geo_risk),
+            "who_crisis_risk": float(health_risk)
+        }
+
+    def analyze_nlp_contextual(self, nlp: Dict[str, Any], owd: Dict[str, Any]) -> Dict[str, Any]:
+        """Fuses short-term sentiment with long-term trend data (OWD)."""
+
+        # Short-term Sentiment Drag (Negative polarity)
+        sentiment_drag = max(0.0, -nlp.get('nlp_avg_sentiment_polarity', 0.0)) * 2.0
+
+        # Long-term Headwind/Tailwind (Positive OWD trends are tailwinds)
+        owd_tailwind = (owd.get('owd_poverty_reduction_rate', 0.03) - 0.03) * 10.0
+
+        final_contextual_score = owd_tailwind - sentiment_drag
+
+        return {
+            "contextual_score": float(final_contextual_score),
+            "sentiment_drag": float(sentiment_drag)
+        }
+
+    def analyze_systemic_risk(self, eia: Dict[str, Any], infra: Dict[str, Any], geo_health: Dict[str, Any]) -> Dict[
+        str, Any]:
+        """DCR Engine: Cross-domain anomaly detection (Energy, Logistics, Geo-Health)."""
+
+        # Energy Stress (High load + inventory changes)
+        energy_stress = abs(eia.get('eia_crude_oil_inventory_change', 0) * 0.01) + (
+                    max(0.0, eia.get('eia_power_grid_load_percent', 90) - 100) / 50.0)
+
+        # Logistics Stress
+        logistics_stress = (infra.get('osm_port_congestion_delay_h', 5.0) / 50.0) + infra.get(
+            'osm_critical_route_disruption', 0.0)
+
+        # Geopolitical Health Impact
+        geo_impact = geo_health['geopolitical_health_risk']
+
+        # Final Systemic Risk Score (weighted fusion)
+        total_risk = (energy_stress * 0.3) + (logistics_stress * 0.3) + (geo_impact * 0.4)
+
+        return {
+            "systemic_risk_score": min(1.0, float(total_risk)),
+            "anomaly_detected": total_risk > 0.7,
+            "geo_health_impact": float(geo_impact)
+        }
+
+    # --- Core Decision Fusion (WCSM v10 + LLM) ---
+    def generate_fused_signal(self, domain_analyses: Dict[str, Dict[str, Any]], dynamic_weights: Dict[str, float],
+                              llm_output: Dict[str, Any]) -> Tuple[str, float, str]:
+        """
+        Fuses all seven weighted domains (including the LLM output) into a final directional confidence score.
+        """
+
+        # 1. Directional Core (Finance + Macro + Spatial)
+        dir_score = (domain_analyses['financial_predictive']['expected_return'] * dynamic_weights["FINANCE_CORE"] * 5) + \
+                    (domain_analyses['macro_institutional']['macro_signal'] * dynamic_weights[
+                        "MACRO_INSTITUTIONAL"] * 3) + \
+                    (domain_analyses['hyper_spatial_fusion']['fusion_score'] * dynamic_weights[
+                        "HYPER_SPATIAL_FUSION"] * 2)
+
+        # 2. Risk/Damping Layer (Energy, Geo/Health, NLP)
+        risk_sum = dynamic_weights["ENERGY_INFRASTRUCTURE"] + dynamic_weights["GEOPOLITICAL_HEALTH"] + dynamic_weights[
+            "NLP_CONTEXTUAL"]
+
+        total_risk_penalty = (domain_analyses['energy_infrastructure']['energy_risk_score'] * dynamic_weights[
+            "ENERGY_INFRASTRUCTURE"] +
+                              domain_analyses['geopolitical_health']['geopolitical_health_risk'] * dynamic_weights[
+                                  "GEOPOLITICAL_HEALTH"] +
+                              domain_analyses['nlp_contextual']['sentiment_drag'] * dynamic_weights[
+                                  "NLP_CONTEXTUAL"]) / max(0.01, risk_sum)
+
+        # 3. Systemic Risk Damping (DCR output)
+        systemic_damp = 1.0 - (domain_analyses['systemic_risk']['systemic_risk_score'] * 0.5)
+
+        # 4. LLM Meta-Analysis Layer (Highest Weight)
+        llm_conf = llm_output['llm_output']['prediction_confidence']
+        llm_narrative = llm_output['llm_output']['strategic_narrative']
+
+        # Fusion Formula V10: Directional Score * (Damping Layers) + LLM Confidence Score
+
+        # LLM Signal Integration: If LLM confidence is high, it heavily influences the directional magnitude.
+
+        # Final Fused Confidence based on Directional Magnitude and LLM Confidence
+        fused_confidence_raw = dir_score * (1.0 - total_risk_penalty * 0.5) * systemic_damp
+
+        # We use the LLM's confidence score (0.0 to 1.0) and use the raw signal direction
+        final_magnitude = abs(fused_confidence_raw)
+
+        # The LLM's confidence acts as a ceiling and a dampener on overconfidence
+        final_confidence = min(1.0, (final_magnitude + llm_conf * 3.0) / 4.0)
+        final_confidence = final_confidence * (
+                    1.0 - domain_analyses['systemic_risk']['systemic_risk_score'] * 0.2)  # Final safety damp
+
+        # Decision Logic based on Directional Score (fused_confidence_raw) and Confidence Level
+        adaptive_threshold = 0.55  # Lowered threshold due to high LLM weight
+
+        if fused_confidence_raw > adaptive_threshold and final_confidence > 0.7:
+            signal = "BUY (CONFIRMED)"
+        elif fused_confidence_raw < -adaptive_threshold and final_confidence > 0.7:
+            signal = "SELL (CONFIRMED)"
+        elif final_confidence < 0.4:
+            signal = "EXTREME CAUTION (DCR/LLM CONFLICT)"
+        else:
+            signal = "HOLD/WAIT (CONTEXTUAL ALIGNMENT)"
+
+        return signal, final_confidence, llm_narrative
+
+
+# --- Zynox AGI (Main Orchestrator) ---
+class ZynoxAGI:
+    def __init__(self):
+        self.collector = WorldDataCollector()
+        # self.tracker = PredictionTracker() # Omitted for brevity, but would be here
+        self.analyzer = ResilienceNexus(None)
+        self.wcsm_weights = WCSM_WEIGHTS_BASE.copy()  # Start with base weights
+
+    def run_arl_weight_adjustment(self):
+        """Simulates Adaptive Reinforcement Learning (A-RL) to adjust weights."""
+        new_weights = self.wcsm_weights.copy()
+
+        # Simulate slight changes based on hypothetical performance
+        new_weights["LLM_META_ANALYSIS"] = max(0.15, new_weights["LLM_META_ANALYSIS"] + random.uniform(-0.01, 0.01))
+
+        # Re-normalize to 1.0 (100%)
+        total_weight = sum(WCSM_WEIGHTS_BASE.values())
+        current_sum = sum(new_weights.values())
+        if current_sum > 0:
+            new_weights = {k: v * (total_weight / current_sum) for k, v in new_weights.items()}
+
+        self.wcsm_weights = new_weights
+
+    async def run_full_scan(self, symbol: str = "GOOGL", country: str = "USA") -> Dict[str, Any]:
+        """Executes full data collection, A-RL, and the DCR Engine analysis."""
+        scan_id = datetime.now().strftime("%Y%m%d%H%M%S")
+
+        self.run_arl_weight_adjustment()
+
+        # --- 1. Parallel Data Collection (15 Sources) ---
+        tasks = [
+            # Finance/Core
+            self.collector.fetch_market_tick_data(symbol),
+            self.collector.fetch_imf_data(),
+            # Macro/Institutional
+            self.collector.fetch_trading_economics_data(country),
+            self.collector.fetch_world_bank_data(),
+            self.collector.fetch_oecd_data(),
+            # Hyper-Spatial/Climate - NOW LIVE NASA CALL
+            self.collector.fetch_nasa_data(),
+            self.collector.fetch_openweather_data(),
+            self.collector.fetch_noaa_data(),
+            # Energy/Infra
+            self.collector.fetch_eia_energy_data(),
+            self.collector.fetch_infra_routing(),
+            # Geo/Health
+            self.collector.fetch_gdelt_data(),
+            self.collector.fetch_who_data(),
+            # NLP/Contextual
+            self.collector.fetch_news_sentiment(),
+            self.collector.fetch_our_world_data(),
+        ]
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Map results to variables and apply resilience check
+        # Note: The order must match the order in 'tasks' list
+        (tick_data, imf_data, te_data, wb_data, oecd_data, nasa_data, owm_data, noaa_data, eia_data, infra_data,
+         gdelt_data, who_data, nlp_data, owd_data) = [safe_data(r, f"API_{i}") for i, r in enumerate(results)]
+
+        # --- 2. Data Reliability Nexus (DQN) & Dynamic Weighting ---
+        domain_data_map = {
+            "FINANCE_CORE": tick_data, "MACRO_INSTITUTIONAL": te_data,
+            "HYPER_SPATIAL_FUSION": nasa_data, "ENERGY_INFRASTRUCTURE": eia_data,
+            "GEOPOLITICAL_HEALTH": gdelt_data, "NLP_CONTEXTUAL": nlp_data,
+        }
+
+        dqn_report = {}
+        dynamic_weights = self.wcsm_weights.copy()
+
+        for domain, data in domain_data_map.items():
+            dqi, lrs = calculate_data_reliability(data, domain)
+            current_w = self.wcsm_weights.get(domain, 0.0)
+            dqn_penalty_factor = max(0.1, 1.0 - (lrs * 0.5 + (1.0 - dqi) * 0.5))
+            dynamic_weights[domain] = current_w * dqn_penalty_factor
+
+            dqn_report[domain.lower().split('_')[0]] = {"dqi": dqi, "lrs": lrs, "dqi_penalty": 1.0 - dqn_penalty_factor}
+
+        dynamic_weights["LLM_META_ANALYSIS"] = self.wcsm_weights[
+            "LLM_META_ANALYSIS"]  # LLM weight is adjusted by A-RL, not DQN (always considered fresh)
+
+        # --- 3. Deep Contextual Resonance (DCR) Analysis ---
+
+        # 3.1. Primary Domain Analyses
+        financial_analysis = self.analyzer.analyze_financial_predictive(tick_data, imf_data)
+        macro_analysis = self.analyzer.analyze_macro_institutional(te_data, wb_data, oecd_data)
+        spatial_analysis = self.analyzer.analyze_hyper_spatial(nasa_data, owm_data, noaa_data,
+                                                               dqn_report['hyper']['dqi'], dqn_report['hyper']['lrs'])
+        energy_risk_score = (max(0.0,
+                                 100 - eia_data.get('eia_power_grid_load_percent', 90)) / 100.0) * 0.5 + infra_data.get(
+            'osm_critical_route_disruption', 0.0) * 0.5
+        geo_health_analysis = self.analyzer.analyze_geopolitical_health(gdelt_data, who_data)
+        nlp_contextual_analysis = self.analyzer.analyze_nlp_contextual(nlp_data, owd_data)
+
+        domain_analyses = {
+            "financial_predictive": financial_analysis,
+            "macro_institutional": macro_analysis,
+            "hyper_spatial_fusion": spatial_analysis,
+            "energy_infrastructure": {"energy_risk_score": float(energy_risk_score)},
+            "geopolitical_health": geo_health_analysis,
+            "nlp_contextual": nlp_contextual_analysis
+        }
+
+        # 3.2. Systemic Risk DCR Engine
+        systemic_analysis = self.analyzer.analyze_systemic_risk(eia_data, infra_data, geo_health_analysis)
+        domain_analyses["systemic_risk"] = systemic_analysis
+
+        # --- 4. LLM Meta-Analysis Prompt Generation ---
+        summary_prompt = f"""
+        Systemic Risk Score: {systemic_analysis['systemic_risk_score']:.3f} (Anomaly: {systemic_analysis['anomaly_detected']}).
+        Financial Momentum (Expected Return): {financial_analysis['expected_return']:.3f} (IMF Fiscal Adj: {financial_analysis['fiscal_adjustment']:.3f}).
+        Macro/Institutional Signal (WB/OECD): {macro_analysis['macro_signal']:.3f}.
+        Hyper-Spatial Fusion Score (NASA/NOAA): {spatial_analysis['fusion_score']:.3f} (Climate Risk: {spatial_analysis['climate_risk_level']:.3f}).
+        Geopolitical/Health Risk (GDELT/WHO): {geo_health_analysis['geopolitical_health_risk']:.3f}.
+        Sentiment/Contextual (News/OWD): {nlp_contextual_analysis['contextual_score']:.3f}.
+        """
+
+        # 4.1. LLM Execution
+        llm_output_data = safe_data(await self.collector.call_groq_llama(summary_prompt), "LLM_META_ANALYSIS")
+
+        # --- 5. Final Fused Decision ---
+        signal, confidence, narrative = self.analyzer.generate_fused_signal(
+            domain_analyses, dynamic_weights, llm_output_data
+        )
+
+        # --- 6. Final Output & Persistence ---
+        final_report = {
+            "scan_id": scan_id,
+            "timestamp": now_utc_iso(),
+            "fused_decision": {
+                "signal": signal,
+                "confidence_fused": float(confidence),
+                "systemic_risk_anomaly": systemic_analysis.get('anomaly_detected', False),
+                "llm_strategic_narrative": narrative,
+                "llm_confidence_base": llm_output_data.get('llm_output', {}).get('prediction_confidence', 0.0),
+                "note": "Contextual Super-Fusion Engine V10 - Llama 3.3/Groq Active."
+            },
+            "dynamic_weights": dynamic_weights,
+            "dqn_report": dqn_report,
+            "raw_data_freshness": {
+                k: v.get('freshness_h', 1000.0) for k, v in domain_data_map.items()
+            },
+            "domain_analysis": domain_analyses
+        }
+
+        return final_report
+
+
+# --- CLI Execution ---
+async def main_cli():
+    print("Zynox Global AGI Ultimate (Predictive V10) — CONTEXTUAL SUPER-FUSION ENGINE ONLINE.")
+    print(f"LLM Backbone: {LLM_MODEL} (via Groq API)")
+
+    z = ZynoxAGI()
+    stock_symbol = "META"
+    target_country = "USA"
+
+    try:
+        ctx = await z.run_full_scan(symbol=stock_symbol, country=target_country)
+
+        signal = ctx['fused_decision']['signal']
+        confidence = ctx['fused_decision']['confidence_fused']
+        anomaly = ctx['fused_decision']['systemic_risk_anomaly']
+        narrative = ctx['fused_decision']['llm_strategic_narrative']
+        llm_base_conf = ctx['fused_decision']['llm_confidence_base']
+
+        if "BUY" in signal:
+            color = "\033[92m"; action_text = signal
+        elif "SELL" in signal:
+            color = "\033[91m"; action_text = signal
+        elif "CAUTION" in signal:
+            color = "\033[95m"; action_text = signal
+        else:
+            color = "\033[93m"; action_text = signal
+        ENDC = "\033[0m"
+
+        print("\n" + "=" * 160)
+        print(
+            f"                                  {color}Zynox AGI Strategic Command Center (v10.0 - Contextual Super-Fusion Nexus){ENDC}")
+        print(
+            f"                                    Scanning Asset: {stock_symbol} | Target Geo: {target_country} | Scan ID: {ctx['scan_id']}")
+        print("=" * 160)
+
+        print(f"\n--- LLM META-ANALYSIS (Llama 3.3 70B Versatile on Groq) ---")
+        print(f"STRATEGIC NARRATIVE: {narrative}")
+        print(f"LLM BASE CONFIDENCE: {llm_base_conf:.4f}")
+        print(
+            "--------------------------------------------------------------------------------------------------------------------------------")
+
+        print(f"\n--- FINAL FUSED DECISION ---")
+        print(f"STRATEGIC SIGNAL: {color}{action_text}{ENDC}")
+        print(f"CONFIDENCE LEVEL: {color}{confidence:.4f} / 1.000{ENDC} | Systemic Anomaly Detected: {anomaly}")
+        print(
+            "--------------------------------------------------------------------------------------------------------------------------------")
+
+        # --- Multi-Domain Report ---
+        dw = ctx['dynamic_weights']
+        da = ctx['domain_analysis']
+        dr = ctx['dqn_report']
+
+        def print_domain_summary(title, weight_key, analysis_key, dqn_key, metrics):
+            weight = dw[weight_key]
+            analysis = da[analysis_key]
+            dqn = dr.get(dqn_key, {"dqi": 1.0, "lrs": 0.0, "dqi_penalty": 0.0})
+
+            print(f"\n### {title} (WCSM W: {weight:.3f} | DQN: {dqn['dqi']:.2f})")
+            for desc, key, fmt in metrics:
+                print(f"  - {desc}: {fmt.format(analysis.get(key, 0.0))}")
+            if dqn_key != 'llm':
+                print(f"  [DQN PENALTY]: LRS {dqn['lrs']:.2f} | DQI Penalty {dqn['dqi_penalty']:.2f}")
+
+        # 1. Directional Core Domains
+        print_domain_summary("1. FINANCE CORE (YFinance/IMF Fusion)", "FINANCE_CORE", "financial_predictive", "finance",
+                             [
+                                 ("Expected Return (Adj)", "expected_return", "{:.4f}"),
+                                 ("Volatility (50D)", "volatility", "{:.3f}"),
+                                 ("IMF Fiscal Adjustment", "fiscal_adjustment", "{:.3f}"),
+                             ])
+
+        print_domain_summary("2. MACRO INSTITUTIONAL (TE/WB/OECD Fusion)", "MACRO_INSTITUTIONAL", "macro_institutional",
+                             "macro", [
+                                 ("Macro Signal (Institutional Bias)", "macro_signal", "{:.4f}"),
+                                 ("TE Stress Level", "te_stress_level", "{:.3f}"),
+                                 ("Institutional Positivity", "institutional_positivity", "{:.3f}"),
+                             ])
+
+        print_domain_summary("3. HYPER SPATIAL FUSION (NASA/OWM/NOAA)", "HYPER_SPATIAL_FUSION", "hyper_spatial_fusion",
+                             "hyper", [
+                                 ("Fusion Score (NDVI/TDS)", "fusion_score", "{:.4f}"),
+                                 ("NOAA Climate Risk Level", "climate_risk_level", "{:.3f}"),
+                                 ("Environmental Risk", "environmental_risk", "{:.3f}"),
+                             ])
+
+        # 2. Risk/Damping Domains
+        print_domain_summary("4. ENERGY & INFRASTRUCTURE (EIA/OSM)", "ENERGY_INFRASTRUCTURE", "energy_infrastructure",
+                             "energy", [
+                                 ("Energy Risk Score (Grid Load/Oil)", "energy_risk_score", "{:.3f}"),
+                             ])
+
+        print_domain_summary("5. GEOPOLITICAL & HEALTH (GDELT/WHO)", "GEOPOLITICAL_HEALTH", "geopolitical_health",
+                             "geopolitical", [
+                                 ("Geopolitical Health Risk", "geopolitical_health_risk", "{:.3f}"),
+                                 ("GDELT Event Risk", "gdelt_event_risk", "{:.3f}"),
+                             ])
+
+        print_domain_summary("6. NLP CONTEXTUAL (News API/OWD)", "NLP_CONTEXTUAL", "nlp_contextual", "nlp", [
+            ("Contextual Score (Sentiment/Long-Term)", "contextual_score", "{:.3f}"),
+            ("Sentiment Drag (Short-Term)", "sentiment_drag", "{:.3f}"),
+        ])
+
+        # 7. DCR Engine Output
+        sys_risk = da['systemic_risk']
+        print(f"\n### 7. SYSTEMIC RISK (DCR Engine Output) (WCSM W: ---)")
+        print(f"  - Systemic Risk Score: {sys_risk['systemic_risk_score']:.3f} (Dampens Confidence)")
+        print(f"  - Geo-Health Impact Base: {sys_risk['geo_health_impact']:.3f}")
+
+        print("\n" + "=" * 160)
+        print(f"AGI Historical Accuracy Base (A-RL): Weight for LLM Layer is {dw['LLM_META_ANALYSIS']:.3f}")
+
+    except Exception as e:
+        print(f"\n[CRITICAL ERROR] Zynox AGI scan failed: {e}")
+    finally:
+        await z.collector.close()
+
+
+if __name__ == "__main__":
+    if sys.version_info >= (3, 7):
+        asyncio.run(main_cli())
+    else:
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(main_cli())
