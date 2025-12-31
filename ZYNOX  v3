@@ -1,0 +1,479 @@
+import asyncio
+import pyttsx3
+import speech_recognition as sr
+import logging
+import numpy as np
+import requests
+import json
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
+import webbrowser
+import os
+from dotenv import load_dotenv
+from typing import Optional
+from functools import partial
+from urllib.parse import urljoin, quote_plus
+
+# --- Load .env ---
+load_dotenv()
+API_KEY = os.getenv("CLOUD_API_KEY")
+OWNER_ID = os.getenv("OWNER_ID", )
+# The URL variables are now set up for the failover mechanism
+PRIMARY_URL = os.getenv("PRIMARY_URL", "https://zynox-cloud.onrender.com/v1/save")
+BACKUP_URL = os.getenv("BACKUP_URL", "http://127.0.0.1:8000/v1/save")
+PRIMARY_QUERY_URL = os.getenv("PRIMARY_QUERY_URL", "https://zynox-cloud.onrender.com/v1/query/")
+BACKUP_QUERY_URL = os.getenv("BACKUP_QUERY_URL", "http://127.0.0.1:8000/v1/query/")
+HOSTING_MODE = os.getenv("HOSTING_MODE", "CLOUD").upper()
+OWNER_VOICE_PATH = os.getenv("OWNER_VOICE_PATH", "zynox_wake.wav")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")  # <<< ADDED GROQ API KEY
+# ---------------- CONFIG ----------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+WAKE_WORDS = ["hey zynox", "hay zynox"]
+SESSION_ACTIVE_SECONDS = 30
+VOICE_AUTH_THRESHOLD = 0.75
+RECORD_DURATION = 2  # seconds
+executor = ThreadPoolExecutor(max_workers=5)
+# ---------------- OPTIONAL LIBRARIES ----------------
+try:
+    from resemblyzer import VoiceEncoder, preprocess_wav
+    import sounddevice as sd
+    import librosa
+    from transformers import pipeline
+
+    MIC_AVAILABLE = True
+except ImportError as e:
+    MIC_AVAILABLE = False
+    logging.warning(f"Voice/audio modules not found. Text-only mode. {e}")
+
+# *** FORCED TEXT MODE OVERRIDE REMOVED ***
+
+# ---------------- INITIALIZE ----------------
+engine = pyttsx3.init()
+recognizer = sr.Recognizer()
+text_emotion_analyzer = None
+
+
+# Async load text emotion model
+async def load_text_model():
+    """Loads the text emotion analysis model."""
+    try:
+        global text_emotion_analyzer
+        # Using to_thread for the blocking model loading to not block the event loop
+        text_emotion_analyzer = await asyncio.to_thread(
+            pipeline,
+            "text-classification",
+            model="j-hartmann/emotion-english-distilroberta-base",
+            top_k=None
+        )
+        logging.info(" Text emotion model loaded.")
+    except Exception as e:
+        logging.warning(f"Text emotion model failed to load: {e}")
+
+
+if MIC_AVAILABLE:
+    asyncio.run(load_text_model())
+else:
+    # Still load the model for text input, even if voice failed
+    logging.info("Running in text-only mode. ZYNOX: prompt will be used for input.")
+    asyncio.run(load_text_model())
+
+
+# ---------------- TTS ----------------
+def speak(text: str):
+    """Synchronous function to make Zynox speak."""
+    engine.say(text)
+    engine.runAndWait()
+
+
+async def speak_async(text: str):
+    """
+    Asynchronous function to make Zynox speak.
+    Also provides a text fallback for text-only mode.
+    """
+    if not MIC_AVAILABLE:
+        # Only print debug message if in pure text-only fallback
+        print(f"Zynox: {text}")
+    if MIC_AVAILABLE:
+        # Use to_thread to run the blocking TTS function without blocking
+        await asyncio.to_thread(speak, text)
+
+
+# ---------------- VOICE EMBEDDING ----------------
+owner_embed = None
+if MIC_AVAILABLE and Path(OWNER_VOICE_PATH).exists():
+    try:
+        encoder = VoiceEncoder()
+        owner_embed = encoder.embed_utterance(preprocess_wav(OWNER_VOICE_PATH))
+    except Exception as e:
+        logging.warning(f"Failed to load owner voice file: {e}. Running text-only mode.")
+        MIC_AVAILABLE = False
+elif MIC_AVAILABLE:
+    logging.warning("Owner voice file not found. Running text-only mode.")
+    MIC_AVAILABLE = False
+
+
+def verify_owner_voice(audio_data: np.ndarray, fs: int = 16000, threshold: float = VOICE_AUTH_THRESHOLD) -> bool:
+    """Verifies if the voice matches the owner's voiceprint."""
+    if not MIC_AVAILABLE or owner_embed is None:
+        return True
+    try:
+        test_embed = encoder.embed_utterance(preprocess_wav(audio_data.astype(np.float32), sr=fs))
+        from sklearn.metrics.pairwise import cosine_similarity
+        similarity = cosine_similarity(owner_embed.reshape(1, -1), test_embed.reshape(1, -1))[0][0]
+        logging.info(f"Voice similarity score: {similarity:.2f}")
+        return similarity >= threshold
+    except Exception as e:
+        logging.error(f"Voice auth failed: {e}")
+        return False
+
+
+# ---------------- RECORD VOICE ----------------
+async def record_voice(duration: int = RECORD_DURATION, fs: int = 16000) -> Optional[np.ndarray]:
+    """Records audio from the microphone."""
+    if MIC_AVAILABLE:
+        try:
+            print("Zynox: Recording...")
+            # Use to_thread to run the blocking sounddevice.rec call
+            audio = await asyncio.to_thread(
+                sd.rec, int(duration * fs), samplerate=fs, channels=1, dtype='float32'
+            )
+            await asyncio.to_thread(sd.wait)
+            return np.squeeze(audio)
+        except Exception as e:
+            logging.error(f"Recording failed: {e}")
+            return None
+    return None
+
+
+# ---------------- EMOTION DETECTION ----------------
+def detect_text_emotion(text: str) -> str:
+    """Detects emotion from text using a pre-trained model."""
+    if text_emotion_analyzer is None:
+        # Fallback to simple keyword detection if model failed to load
+        text_lower = text.lower()
+        if any(w in text_lower for w in ["happy", "great", "joy"]):
+            return "happy"
+        elif any(w in text_lower for w in ["sad", "depressed", "unhappy"]):
+            return "sadness"
+        elif any(w in text_lower for w in ["angry", "mad", "furious"]):
+            return "angry"
+        return "neutral"
+    try:
+        results = text_emotion_analyzer(text)[0]
+        best = max(results, key=lambda x: x['score'])
+        return best['label'].lower()
+    except Exception:
+        return "neutral"
+
+
+def detect_speech_emotion(audio_data: np.ndarray) -> str:
+    """
+    Detects emotion from raw audio data.
+    NOTE: This requires integrating a dedicated Speech Emotion Recognition (SER) model.
+    For now, it remains a simple placeholder.
+    """
+    logging.info("Attempting speech emotion detection (SER model not implemented).")
+    # For a real implementation, you would load an SER model (e.g., from Torchaudio or a custom Keras/PyTorch model)
+    # and run inference on the audio_data here.
+    # Placeholder logic:
+    import random
+    return random.choice(["happy", "sadness", "angry", "neutral"])  # Removed 'frustrated' for simplicity
+
+
+# ---------------- CLOUD MEMORY ----------------
+def save_to_cloud(user_id: str, data: str, tags: Optional[list] = None):
+    """
+    Saves data to the cloud service with a failover mechanism.
+    It first tries the primary URL. If that fails, it tries the backup URL.
+    """
+    if not API_KEY or not user_id:
+        logging.error("API key or Owner ID not found. Cloud save failed.")
+        return
+    payload = {"owner_id": user_id, "data": data, "tags": tags or []}
+    headers = {"x-api-key": API_KEY}
+    primary_url = PRIMARY_URL
+    backup_url = BACKUP_URL
+    if HOSTING_MODE == "BACKUP":
+        primary_url, backup_url = backup_url, primary_url
+    # First, try to save to the primary URL.
+    try:
+        logging.info(f"Attempting to save to primary URL: {primary_url}")
+        # Increased timeout to 15 seconds to handle Render's cold start
+        response = requests.post(primary_url, json=payload, headers=headers, timeout=15)
+        response.raise_for_status()
+        logging.info("Memory successfully saved to primary cloud. Status: %s", response.status_code)
+        return
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Primary cloud save failed: {e}. Attempting backup...")
+    # If the primary fails, try to save to the backup URL.
+    try:
+        logging.info(f"Attempting to save to backup URL: {backup_url}")
+        # Use a shorter timeout for local host since it should be fast
+        response = requests.post(backup_url, json=payload, headers=headers, timeout=5)
+        response.raise_for_status()
+        logging.info("Memory successfully saved to backup cloud. Status: %s", response.status_code)
+    except requests.exceptions.RequestException as e:
+        logging.critical(f"Backup cloud save failed: {e}. Data could not be saved.")
+
+
+def query_cloud(user_id: str, tags: Optional[list] = None) -> list:
+    """
+    Queries data from the cloud service with a failover mechanism.
+    """
+    if not API_KEY or not user_id:
+        logging.error("API key or Owner ID not found. Cloud query failed.")
+        return []
+    headers = {"x-api-key": API_KEY}
+    primary_url = urljoin(PRIMARY_QUERY_URL, quote_plus(user_id))
+    backup_url = urljoin(BACKUP_QUERY_URL, quote_plus(user_id))
+    # Add tags to the query URL
+    if tags:
+        primary_url += f"?tags={','.join(tags)}"
+        backup_url += f"?tags={','.join(tags)}"
+    if HOSTING_MODE == "BACKUP":
+        primary_url, backup_url = backup_url, primary_url
+    try:
+        logging.info(f"Attempting to query primary URL: {primary_url}")
+        response = requests.get(primary_url, headers=headers, timeout=15)
+        response.raise_for_status()
+        logging.info("Data successfully retrieved from primary cloud.")
+        return response.json().get("data", [])
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Primary cloud query failed: {e}. Attempting backup...")
+    try:
+        logging.info(f"Attempting to query backup URL: {backup_url}")
+        response = requests.get(backup_url, headers=headers, timeout=5)
+        response.raise_for_status()
+        logging.info("Data successfully retrieved from backup cloud.")
+        return response.json().get("data", [])
+    except requests.exceptions.RequestException as e:
+        logging.critical(f"Backup cloud query failed: {e}. Data could not be retrieved.")
+        return []
+
+
+# ---------------- DATA ANALYSIS ----------------
+async def analyze_past_activities(user_id: str, emotion: str) -> str:
+    """Analyzes past memories for a specific emotion and provides a summary."""
+    memories = await asyncio.to_thread(query_cloud, user_id, tags=[emotion])
+    if not memories:
+        return f"I couldn't find any past memories related to feeling {emotion}."
+    # Sort memories by timestamp (assuming `timestamp` is a key in each dictionary)
+    memories.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
+    # Get the last few activities
+    recent_memories = memories[:3]  # Get the 3 most recent memories
+    if not recent_memories:
+        return f"I found memories but couldn't parse the activities for the emotion {emotion}."
+    # A simple way to summarize the activities
+    summary = []
+    for mem in recent_memories:
+        data = mem.get("data", "")
+        summary.append(data.split(' - ')[0])  # Assuming data format is "text - emotion"
+    summary_text = " and ".join(summary)
+    return f"The last few times you felt {emotion}, you were doing things like: {summary_text}."
+
+
+# ---------------- LLM ADVICE GENERATION (GROQ) ----------------
+async def get_groq_advice(user_text: str, emotion: str, memories: list) -> str:
+    """Uses Groq API to provide personalized advice based on emotion and past memories."""
+    if not GROQ_API_KEY:
+        logging.error("GROQ_API_KEY not found. Cannot generate personalized advice.")
+        return f"I need my Groq API key to give you personalized advice. For now, let's stick with some music for your {emotion} mood."
+
+    # Format memories for prompt
+    if memories:
+        # Extract the 'data' part (the text/emotion combination) from the documents
+        past_activities = "\n".join([f"- {mem.get('data', 'No detail')}" for mem in memories])
+        memory_context = f"Your user provided the following past activities where they felt {emotion}:\n{past_activities}\n"
+    else:
+        memory_context = f"The user has no recorded memories of feeling {emotion}."
+
+    system_prompt = f"""
+    You are Zynox, a supportive, friendly, and emotionally intelligent AI companion. 
+    Your goal is to provide insightful and helpful advice to a user, who is under 18 years old. 
+    The tone must be safe, positive, age-appropriate, and encouraging. 
+    The user is currently feeling '{emotion}' and is talking about: '{user_text}'.
+    {memory_context}
+    Based on their current emotion and past history, provide a compassionate response and suggest ONE simple, healthy action they can take right now. Keep your response concise (3-4 sentences max).
+    Do not mention 'Groq', 'LLaMA', or any model names.
+    """
+
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    # Using the suggested llama-3.1-70b-versatile for high quality and speed
+    payload = {
+        "model": "llama-3.1-70b-versatile",
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_text}
+        ],
+        "temperature": 0.7,
+        "max_tokens": 300,
+    }
+    url = "https://api.groq.com/openai/v1/chat/completions"
+
+    try:
+        # Use asyncio.to_thread for the blocking requests call
+        response = await asyncio.to_thread(
+            requests.post, url, headers=headers, json=payload, timeout=15
+        )
+        response.raise_for_status()
+        result = response.json()
+
+        # Extract the model's response
+        advice = result['choices'][0]['message']['content'].strip()
+        logging.info(" Groq advice generated.")
+        return advice
+
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Groq API call failed: {e}")
+        return f"I had trouble connecting to my creative mind right now to give you advice. Let's stick with some music for your {emotion} mood."
+    except Exception as e:
+        logging.error(f"Error processing Groq response: {e}")
+        return f"Something went wrong while generating advice. Let's try that again later."
+
+
+# ---------------- EMOTION RESPONSES (STATIC MUSIC LINKS KEPT) ----------------
+FAVORITE_SONGS = {
+    "happy": "https://www.youtube.com/watch?v=d-diB65scQU",  # Upbeat/Positive
+    "sadness": "https://www.youtube.com/watch?v=hLQl3WQQoQ0",  # Soothing/Reflective
+    "angry": "https://www.youtube.com/watch?v=8SbUC-UaAxE",  # High-energy/Release
+    "frustrated": "https://www.youtube.com/watch?v=8SbUC-UaAxE",  # High-energy/Release
+    "neutral": "https://www.youtube.com/watch?v=3JWTaaS7LdU"  # Calm/Focus
+}
+
+
+# ---------------- LISTEN COMMAND ----------------
+async def listen_command(timeout: Optional[int] = None) -> tuple[Optional[str], Optional[np.ndarray]]:
+    """Listens for a command from either the microphone or text input."""
+    # Attempt voice input if available
+    if MIC_AVAILABLE:
+        try:
+            with sr.Microphone() as source:
+                # This adjust_for_ambient_noise is a blocking call, so we must run it in a thread.
+                await asyncio.to_thread(recognizer.adjust_for_ambient_noise, source, duration=0.5)
+                # This listen call is also blocking.
+                audio = await asyncio.to_thread(recognizer.listen, source, timeout, 6)
+                # This recognize_google call is blocking as well.
+                text = await asyncio.to_thread(recognizer.recognize_google, audio)
+                return text.lower(), np.frombuffer(audio.get_raw_data(), dtype=np.int16)
+        except sr.UnknownValueError:
+            pass  # No speech, fall through to text prompt
+        except Exception:
+            logging.warning("Microphone error or timeout.")
+            pass  # Microphone issue, fall through to text prompt
+
+    # --- HYBRID/TEXT INPUT PATH ---
+    # This path is hit if MIC is UNAVAILABLE or if Voice detection FAILED/TIMED OUT.
+    # It will block until text is entered, providing the ZYNOX: prompt.
+    try:
+        text = await asyncio.to_thread(input, "ZYNOX: ")
+        return text.strip().lower(), None
+    except EOFError:
+        return None, None
+    except KeyboardInterrupt:
+        raise
+
+
+# ---------------- ROUTER ----------------
+async def route_command(text: str, audio_data: Optional[np.ndarray] = None):
+    """Main function to process a command, detect emotion, and respond automatically."""
+    if not text:
+        return
+    print(f"DEBUG: Processing command: '{text}'")
+
+    # Check for memory/analysis-related commands first
+    if "what did i do" in text or "when i was" in text:
+        emotion_keywords = ["happy", "sad", "angry", "frustrated", "neutral"]
+        detected_emotion = next((word for word in emotion_keywords if word in text), None)
+        if detected_emotion:
+            # Analyze and respond
+            response = await analyze_past_activities(OWNER_ID, detected_emotion)
+            await speak_async(response)
+        else:
+            await speak_async(
+                "I can analyze your past activities, but I need to know which emotion to look for. For example, 'what did I do when I was sad?'")
+        return
+
+    # --- AUTOMATIC EMOTION DETECTION, ADVICE, and MUSIC ---
+    # 1. Detect Emotion: Use Speech if available and a non-wake word command, otherwise use Text
+    if audio_data is not None and MIC_AVAILABLE:
+        # Use a random choice if speech emotion is still a placeholder
+        emotion = await asyncio.to_thread(detect_speech_emotion, audio_data)
+    else:
+        # Fallback to Text emotion detection
+        emotion = await asyncio.to_thread(detect_text_emotion, text)
+    print(f"DEBUG: Detected emotion: '{emotion}'")
+    await speak_async(f"I detect you are feeling {emotion}.")
+
+    # 2. Retrieve Past Memories
+    # We fetch ALL memories for this emotion to give Groq the best context
+    memories = await asyncio.to_thread(query_cloud, OWNER_ID, tags=[emotion])
+
+    # 3. Generate Personalized Advice using Groq
+    advice_text = await get_groq_advice(text, emotion, memories)
+    await speak_async(advice_text)  # Zynox speaks the LLM advice
+
+    # 4. Save to Memory (Non-blocking)
+    asyncio.create_task(
+        asyncio.to_thread(
+            save_to_cloud, OWNER_ID, f"{text} - emotion:{emotion}", tags=[emotion]
+        )
+    )
+
+    # 5. Play Music Automatically
+    song_link = FAVORITE_SONGS.get(emotion, FAVORITE_SONGS["neutral"])
+    await speak_async(f"I've also found a song for your {emotion} mood. Opening your browser now.")
+    webbrowser.open(song_link, new=2)
+
+
+# ---------------- MAIN LOOP ----------------
+async def wake_router():
+    """The main loop to listen for commands and route them."""
+    await speak_async("Zynox is online. Say 'Hey Zynox' or enter a command.")
+    session_active_until = 0
+    while True:
+        try:
+            # listen_command now handles both voice attempt/timeout and the ZYNOX: prompt
+            cmd_text, audio_data = await listen_command(timeout=2)
+            now = asyncio.get_event_loop().time()
+
+            if not cmd_text:
+                continue
+
+            is_wake_word = any(word in str(cmd_text) for word in WAKE_WORDS)
+
+            # If the command is NOT the wake word, OR the session is active, process it immediately.
+            # This handles: 1. Typed commands, 2. Spoken commands (non-wake), 3. Commands during active session.
+            if not is_wake_word or now < session_active_until:
+                await route_command(cmd_text, audio_data)
+                session_active_until = now + SESSION_ACTIVE_SECONDS
+                continue  # Go to the next loop iteration
+
+            # If we reach here, it must be the wake word, and the session is inactive.
+
+            # --- Wake Word Logic (Voice Verification) ---
+            wake_audio = None
+            if MIC_AVAILABLE and audio_data is not None:
+                # Only ask for recording if the wake word was SPOKEN and we have the mic
+                wake_audio = await record_voice()
+
+            # Verify owner voice (or skip if voice check is not applicable/failed to record)
+            if wake_audio is None or await asyncio.to_thread(verify_owner_voice, wake_audio):
+                await speak_async("Voice verified. How can I help?")
+                session_active_until = now + SESSION_ACTIVE_SECONDS
+            else:
+                await speak_async("Sorry, I can't verify your voice.")
+
+        except KeyboardInterrupt:
+            logging.info("Shutting down Zynox...")
+            break
+        except Exception as e:
+            logging.error(f"An error occurred in the main loop: {e}")
+
+
+# ---------------- RUN ----------------
+if __name__ == "__main__":
+    asyncio.run(wake_router())
