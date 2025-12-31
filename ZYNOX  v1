@@ -1,0 +1,374 @@
+
+import cv2
+import face_recognition
+from deepface import DeepFace
+import datetime, json, sys, os, random
+import numpy as np
+import asyncio
+import aiohttp
+import logging
+from plyer import notification
+from dotenv import load_dotenv
+import multiprocessing
+from multiprocessing import Queue
+import pickle
+import time
+import pyttsx3
+import speech_recognition as sr
+import webbrowser
+
+# --- CONFIG & INITIALIZATION ---
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger('Zynox')
+
+load_dotenv()
+
+# File paths
+SERVICE_FILE = r"C:\zynox_agi\zynox_service.json"
+CLOUD_MEMORY_FILE = r"C:\zynox_agi\zynox_cloud_encrypted.bin"
+
+# Core Config
+AUTHORIZED_FACE_IMAGE = "user_face.jpg"
+ALERT_EMOTIONS = ["angry", "fear", "sad", "disgust", "frustrated"]
+ALERT_THRESHOLD = 0.65
+OWNER_ID = "ZA YN"
+CLOUD_API_URL = os.environ.get("CLOUD_API_URL", "https://zynox-cloud.onrender.com/v1/save")
+CLOUD_API_KEY = os.environ.get("CLOUD_API_KEY")
+
+# LLM Config
+USE_OPENROUTER = True
+USE_OPENAI = False
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
+OPENROUTER_MODEL = "deepseek/deepseek-chat-v3.1:free"
+GPT_API_URL = "https://api.openai.com/v1/chat/completions"
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+# --- Validate configuration before starting the application ---
+if not os.path.exists(AUTHORIZED_FACE_IMAGE):
+    logger.critical(f" Authorized face image missing! Place '{AUTHORIZED_FACE_IMAGE}' in the script directory.")
+    sys.exit()
+
+if USE_OPENAI and not OPENAI_API_KEY:
+    logger.critical(" Missing OpenAI API key in .env. Exiting.")
+    sys.exit()
+
+if USE_OPENROUTER and not OPENROUTER_API_KEY:
+    logger.critical(" Missing OpenRouter API key in .env. Exiting.")
+    sys.exit()
+
+if not CLOUD_API_KEY:
+    logger.critical(" Missing Cloud API key in .env. Exiting.")
+    sys.exit()
+
+try:
+    authorized_image = face_recognition.load_image_file(AUTHORIZED_FACE_IMAGE)
+    authorized_encoding = face_recognition.face_encodings(authorized_image)[0]
+except Exception as e:
+    logger.critical(f" Error processing authorized face image: {e}")
+    sys.exit()
+
+# --- INITIALIZE SPEECH ---
+speech_engine = pyttsx3.init()
+speech_recognizer = sr.Recognizer()
+
+# --- JSON ENCODER FOR NUMPY ---
+class NpEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, np.integer): return int(obj)
+        if isinstance(obj, np.floating): return float(obj)
+        if isinstance(obj, np.bool_): return bool(obj)
+        if isinstance(obj, np.ndarray): return obj.tolist()
+        return super().default(obj)
+
+# --- HELPER FUNCTIONS ---
+def local_alert(msg):
+    notification.notify(title="Zynox Alert", message=msg, timeout=3)
+    logger.warning(f" {msg}")
+
+async def send_remote_notification(msg):
+    logger.info(f" Remote: {msg}")
+
+async def log_to_cloud(event_type, emotion, score, recognized_user, extra=None):
+    if score is None:
+        score = 0.0
+    payload = {
+        "owner_id": OWNER_ID,
+        "key": event_type,
+        "data": json.dumps({
+            "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+            "event_type": event_type,
+            "emotion": emotion,
+            "score": float(score),
+            "recognized_user": bool(recognized_user),
+            "extra": extra
+        }, cls=NpEncoder),
+        "tags": ["zynox_brain", "AGI", "human_like", "ultimate"]
+    }
+    headers = {"x-api-key": CLOUD_API_KEY}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(CLOUD_API_URL, json=payload, headers=headers) as resp:
+                resp.raise_for_status()
+                logger.info(f Logged {event_type} to cloud.")
+    except aiohttp.ClientError as e:
+        logger.error(f" Cloud log error: {e}")
+
+async def get_llm_response(prompt, temperature=0.7):
+    model = OPENROUTER_MODEL if USE_OPENROUTER else "gpt-4o-mini"
+    api_url = OPENROUTER_URL if USE_OPENROUTER else GPT_API_URL
+    api_key = OPENROUTER_API_KEY if USE_OPENROUTER else OPENAI_API_KEY
+
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    if USE_OPENROUTER:
+        headers.update({"HTTP-Referer": "https://www.your-app-url.com", "X-Title": "Zynox Ultimate AGI"})
+
+    payload = {
+        "model": model,
+        "messages": [{"role": "system", "content": "You are a human-like AGI assistant named Zynox. Use a casual, supportive, and friendly tone. Keep responses brief."},
+                     {"role": "user", "content": prompt}],
+        "temperature": temperature
+    }
+    try:
+        async with aiohttp.ClientSession(headers=headers) as session:
+            async with session.post(api_url, json=payload) as resp:
+                resp.raise_for_status()
+                response_json = await resp.json()
+                return response_json["choices"][0]["message"]["content"]
+    except Exception as e:
+        logger.error(f" LLM API call failed: {e}")
+        return json.dumps({"action": "fallback", "confidence": 1.0, "explanation": "API call failed."})
+
+def speak(text):
+    speech_engine.say(text)
+    speech_engine.runAndWait()
+
+def listen():
+    with sr.Microphone() as source:
+        logger.info("Listening for command...")
+        audio = speech_recognizer.listen(source, timeout=5)
+    try:
+        command = speech_recognizer.recognize_google(audio).lower()
+        logger.info(f"You said: {command}")
+        return command
+    except sr.UnknownValueError:
+        logger.warning("Could not understand audio.")
+        return ""
+    except sr.RequestError as e:
+        logger.error(f"Could not request results from Google Speech Recognition service; {e}")
+        return ""
+
+# --- Music via YouTube based on emotion ---
+def play_music_youtube(emotion):
+    query = None
+    if emotion == "happy":
+        query = "Justin Bieber Dua Lipa Alan Walker The Weeknd upbeat playlist"
+    elif emotion == "sad":
+        query = "Lana Del Rey sad playlist"
+    elif emotion == "angry":
+        query = "Calm lofi beats playlist"
+    elif emotion in ["frustrated", "depressed"]:
+        query = "Mind Fresh relaxing playlist"
+
+    if query:
+        url = f"https://www.youtube.com/results?search_query={query.replace(' ', '+')}"
+        webbrowser.open(url)
+        logger.info(f" Playing on YouTube: {query}")
+        return True
+    return False
+
+# --- CORE AGI LOGIC ---
+class ZynoxCoreLogic:
+    def __init__(self):
+        self.decision_history = []
+        self.lifetime_memory = []
+        self.load_local_data()
+
+    def load_local_data(self):
+        if os.path.exists(SERVICE_FILE):
+            try:
+                with open(SERVICE_FILE, "r") as f:
+                    self.decision_history = json.load(f).get("decision_history", [])
+                logger.info(" Loaded decision history from service file.")
+            except Exception as e:
+                logger.error(f" Failed to load service data: {e}")
+        if os.path.exists(CLOUD_MEMORY_FILE):
+            try:
+                with open(CLOUD_MEMORY_FILE, "rb") as f:
+                    self.lifetime_memory = pickle.load(f)
+                logger.info(" Loaded cloud memory from binary file.")
+            except Exception as e:
+                logger.error(f" Failed to load cloud memory: {e}")
+
+    def save_service_data(self):
+        try:
+            with open(SERVICE_FILE, "w") as f:
+                json.dump({"decision_history": self.decision_history}, f, indent=2)
+            logger.debug("Saved decision history.")
+        except IOError as e:
+            logger.error(f" Failed to save service data: {e}")
+
+    def save_cloud_memory(self):
+        try:
+            with open(CLOUD_MEMORY_FILE, "wb") as f:
+                pickle.dump(self.lifetime_memory, f)
+            logger.debug("Saved cloud memory.")
+        except IOError as e:
+            logger.error(f" Failed to save cloud memory: {e}")
+
+    async def decide_action(self, emotion, score, recognized_user):
+        situation = {"recognized_user": bool(recognized_user), "emotion": emotion, "score": score}
+        if not recognized_user:
+            options = ["lock_system", "alert_owner", "record_evidence"]
+        elif emotion in ALERT_EMOTIONS and score > ALERT_THRESHOLD:
+            options = ["start_conversation_and_play_music", "notify_owner", "log_mood"]
+        else:
+            options = ["log_normal_mood", "play_happy_music", "no_action"]
+
+        confidence = random.uniform(0.7, 0.95)
+        prompt = f"Situation: {json.dumps(situation, cls=NpEncoder)}\nOptions: {options}\nConfidence: {confidence:.2f}\nRespond with JSON: {{'action':str,'confidence':float,'explanation':str}}"
+
+        decision_json = await get_llm_response(prompt)
+        try:
+            decision = json.loads(decision_json)
+        except Exception:
+            logger.error(f"Failed to decode decision JSON: {decision_json}")
+            decision = {"action": "fallback", "confidence": 1.0, "explanation": "Fallback triggered."}
+
+        self.decision_history.append({"decision": decision, "timestamp": datetime.datetime.utcnow().isoformat() + "Z"})
+        self.save_service_data()
+
+        return decision
+
+    async def execute_decision(self, decision, emotion=None):
+        action = decision.get("action", "fallback")
+        explanation = decision.get("explanation", "")
+        score = decision.get("score") or 0.0
+        logger.info(f"Executing action: {action} | Explanation: {explanation}")
+
+        if action == "lock_system":
+            local_alert("Intruder Detected!")
+        elif action == "alert_owner":
+            await send_remote_notification("Intruder detected!")
+        elif action == "start_conversation_and_play_music":
+            llm_prompt = f"The user, Zay, is experiencing high '{emotion}' emotion. Draft a simple, human-like question to check on them."
+            response_text = await get_llm_response(llm_prompt)
+            speak(response_text)
+
+            command = listen()
+            if "play" in command and ("song" in command or "music" in command):
+                speak("Of course, playing some music for you.")
+                play_music_youtube(emotion)
+            else:
+                speak("Okay, let me know if you need anything else.")
+
+        elif action == "play_happy_music":
+            speak("You look great! Let's play some music for your mood.")
+            play_music_youtube("happy")
+
+        elif action == "notify_owner":
+            await send_remote_notification("Owner detected with high stress levels.")
+        elif action in ["log_mood", "log_normal_mood"]:
+            await log_to_cloud(action, emotion, float(score), True)
+        elif action == "fallback":
+            logger.error(" Fallback action triggered.")
+
+# --- AI WORKER PROCESS ---
+def ai_worker(in_q, out_q, auth_enc):
+    logger.info("⚙️ AI Worker process started.")
+    while True:
+        try:
+            frame = in_q.get()
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            face_locations = face_recognition.face_locations(rgb_frame)
+            face_encodings = face_recognition.face_encodings(rgb_frame, face_locations)
+
+            recognized = False
+            emotion = "neutral"
+            score = 0.0
+
+            if face_locations:
+                match = face_recognition.compare_faces([auth_enc], face_encodings[0])
+                recognized = any(match)
+
+                if recognized:
+                    try:
+                        analysis_results = DeepFace.analyze(img_path=frame, actions=['emotion'], enforce_detection=False)
+                        if analysis_results and len(analysis_results) > 0:
+                            emotion_dict = analysis_results[0].get("emotion")
+                            if emotion_dict:
+                                emotion, score = max(emotion_dict.items(), key=lambda item: item[1])
+                    except Exception as e:
+                        logger.error(f"DeepFace analysis error: {e}")
+                        emotion = "neutral"
+                        score = 0.0
+
+            out_q.put({"face_locations": face_locations, "recognized": recognized, "emotion": emotion, "score": score})
+        except Exception as e:
+            logger.error(f" AI Worker error: {e}")
+            out_q.put({"error": str(e)})
+
+# --- MAIN LOOP ---
+async def main_loop():
+    logger.info(" Zynox Ultimate AGI (Multiprocessed) started. Press 'q' to quit.")
+    frame_queue = Queue(maxsize=1)
+    results_queue = Queue(maxsize=1)
+    ai_process = multiprocessing.Process(target=ai_worker, args=(frame_queue, results_queue, authorized_encoding))
+    ai_process.daemon = True
+    ai_process.start()
+
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        logger.critical(" Could not access webcam.")
+        ai_process.terminate()
+        return
+
+    zynox_brain = ZynoxCoreLogic()
+    last_processed_time = time.time()
+    last_decision_time = time.time()
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        cv2.imshow("Zynox AGI", frame)
+
+        if time.time() - last_processed_time > 0.5:
+            if frame_queue.empty():
+                frame_queue.put(frame)
+                last_processed_time = time.time()
+
+        if not results_queue.empty():
+            ai_results = results_queue.get()
+            if "error" in ai_results:
+                logger.error(f"Received error from worker: {ai_results['error']}")
+            else:
+                recognized = ai_results["recognized"]
+                emotion = ai_results["emotion"]
+                score = ai_results["score"]
+                face_locations = ai_results["face_locations"]
+
+                if time.time() - last_decision_time > 10:
+                    decision = await zynox_brain.decide_action(emotion, score, recognized)
+                    await zynox_brain.execute_decision(decision, emotion)
+                    last_decision_time = time.time()
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    logger.info("Shutting down Zynox...")
+    cap.release()
+    cv2.destroyAllWindows()
+    ai_process.terminate()
+    ai_process.join()
+    logger.info("All processes shut down.")
+
+# --- ENTRY POINT ---
+if __name__ == "__main__":
+    multiprocessing.freeze_support()
+    try:
+        asyncio.run(main_loop())
+    except KeyboardInterrupt:
+        logger.info("Exiting Zynox...")
