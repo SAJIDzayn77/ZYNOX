@@ -1,0 +1,236 @@
+
+import asyncio
+import pyttsx3
+import speech_recognition as sr
+import logging
+import numpy as np
+from pathlib import Path
+from tempfile import NamedTemporaryFile
+from sklearn.metrics.pairwise import cosine_similarity
+import subprocess
+import sys
+
+# Optional voice features
+try:
+    from resemblyzer import VoiceEncoder, preprocess_wav
+    import sounddevice as sd
+    from scipy.io.wavfile import write
+    MIC_AVAILABLE = True
+except ImportError:
+    MIC_AVAILABLE = False
+    print(" Voice modules not available. Running in text-only mode.")
+
+# ---------------- CONFIG ----------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+WAKE_WORDS = ["hay zynox", "hey zynox"]
+OWNER_VOICE_PATH = "zynox_wake.wav"
+SESSION_ACTIVE_SECONDS = 20
+VOICE_AUTH_THRESHOLD = 0.75
+RECORD_DURATION = 3
+
+# ---------------- INITIALIZE ----------------
+engine = pyttsx3.init()
+recognizer = sr.Recognizer()
+
+laptop_mic_index = None
+if MIC_AVAILABLE:
+    try:
+        # List available microphones
+        mic_names = sr.Microphone.list_microphone_names()
+        print("Available microphones:", mic_names)
+
+        # Try to find built-in mic automatically
+        for i, name in enumerate(mic_names):
+            if "realtek" in name.lower() or "array" in name.lower():
+                laptop_mic_index = i
+                break
+
+        if laptop_mic_index is None:
+            logging.warning(" Could not auto-detect laptop mic, falling back to default index 0")
+            laptop_mic_index = 0
+
+        mic = sr.Microphone(device_index=laptop_mic_index)
+        encoder = VoiceEncoder()
+        logging.info(f"🎤 Using laptop microphone: {mic_names[laptop_mic_index]} (index {laptop_mic_index})")
+
+    except Exception as e:
+        logging.warning(f"🎤 No microphone detected, running in text-only mode. Error: {e}")
+        MIC_AVAILABLE = False
+
+# ---------------- LOAD MODULES ----------------
+import zynox_AGI_v2 as agi_v2
+import zynox_AGI_v3 as agi_v3
+import zynox_AGI_v4 as agi_v4
+import zynox_calender as zcalender
+import zynox_search as zsearch
+import knowledge  # Advanced Knowledge module
+
+modules = {
+    "AGIv2": agi_v2,
+    "AGIv3": agi_v3,
+    "AGIv4": agi_v4,
+    "calender": zcalender,
+    "search": zsearch,
+    "knowledge": knowledge.AdvancedKnowledge()
+}
+
+# ---------------- BACKEND SERVICES ----------------
+def start_backend_services():
+    logging.info(" Starting Zynox API server...")
+    subprocess.Popen([sys.executable, "zynox_server1.py"])
+    logging.info(" Starting Zynox Dashboard...")
+    subprocess.Popen([sys.executable, "-m", "streamlit", "run", "zynox_dashboard.py", "--server.headless", "true"])
+
+# ---------------- LOAD OWNER VOICE ----------------
+if MIC_AVAILABLE and Path(OWNER_VOICE_PATH).exists():
+    owner_embed = encoder.embed_utterance(preprocess_wav(OWNER_VOICE_PATH))
+elif MIC_AVAILABLE:
+    logging.critical(" No registered voice found. Please record OWNER_VOICE_PATH first.")
+    exit()
+
+# ---------------- TTS ----------------
+def speak(text):
+    engine.say(text)
+    engine.runAndWait()
+
+async def speak_async(text):
+    await asyncio.to_thread(speak, text)
+
+# ---------------- VOICE AUTH ----------------
+def verify_owner_voice(audio_data, fs=16000, threshold=VOICE_AUTH_THRESHOLD):
+    try:
+        with NamedTemporaryFile(suffix=".wav", delete=True) as temp_file:
+            write(temp_file.name, fs, audio_data.astype(np.float32))
+            test_embed = encoder.embed_utterance(preprocess_wav(temp_file.name))
+        similarity = cosine_similarity(owner_embed.reshape(1, -1), test_embed.reshape(1, -1))[0][0]
+        logging.info(f" Voice similarity score: {similarity:.2f}")
+        return similarity >= threshold
+    except Exception as e:
+        logging.error(f"Voice auth failed: {e}")
+        return False
+
+# ---------------- LISTEN ----------------
+async def listen_command(timeout=None):
+    if MIC_AVAILABLE:
+        try:
+            with mic as source:
+                recognizer.adjust_for_ambient_noise(source, duration=0.5)
+                audio = await asyncio.to_thread(recognizer.listen, source, timeout=timeout, phrase_time_limit=6)
+                text = await asyncio.to_thread(recognizer.recognize_google, audio)
+                return text.lower()
+        except Exception:
+            return None
+    else:
+        return input("Type your command for Zynox: ").strip().lower()
+
+async def record_voice(duration=RECORD_DURATION, fs=16000):
+    if MIC_AVAILABLE:
+        try:
+            audio = sd.rec(int(duration * fs), samplerate=fs, channels=1)
+            sd.wait()
+            return np.squeeze(audio)
+        except Exception as e:
+            logging.error(f"Recording failed: {e}")
+            return None
+    return None
+
+# ---------------- ROUTER ----------------
+async def route_command(command_text):
+    logging.info(f"Routing command: {command_text}")
+    try:
+        # Explicit AGI selection
+        if command_text.startswith("v2 "):
+            reply = modules["AGIv2"].dispatch(command_text[3:])
+            await speak_async(f"AGIv2 Response: {reply}")
+            return
+        elif command_text.startswith("v3 "):
+            try:
+                reply = await modules["AGIv3"].dispatch(command_text[3:])
+                await speak_async(f"AGIv3 Response: {reply}")
+            except Exception as e:
+                logging.warning(f"AGIv3 failed: {e}. Falling back to AGIv2.")
+                reply_v2 = modules["AGIv2"].dispatch(command_text[3:])
+                await speak_async(f"AGIv2 Response: {reply_v2}")
+            return
+
+        # Knowledge commands
+        if any(k in command_text for k in ["solve", "calculate", "chemistry", "biology", "math"]):
+            if "math" in command_text or "solve" in command_text or "calculate" in command_text:
+                response = modules["knowledge"].solve_math(command_text)
+            elif "chemistry" in command_text:
+                response = modules["knowledge"].chemistry_mass(command_text)
+            elif "biology" in command_text:
+                response = modules["knowledge"].biology_info(command_text)
+            else:
+                response = "I couldn't interpret the knowledge request."
+            await speak_async(f"Result: {response}")
+
+        # Search commands
+        elif any(k in command_text for k in ["search", "look up", "find"]):
+            result = await modules["search"].main_search(command_text)
+            await speak_async(f"Search result: {result}")
+
+        # Calendar commands
+        elif any(k in command_text for k in ["calendar", "reminder", "event"]):
+            await modules["calendar"].add_event_from_command(command_text)
+
+        # AGI commands (default)
+        elif any(k in command_text for k in ["plan", "memory", "remember"]):
+            try:
+                reply = await modules["AGIv3"].dispatch(command_text)
+                await speak_async(reply)
+            except Exception as e:
+                logging.warning(f"AGIv3 failed: {e}. Falling back to AGIv2.")
+                reply_v2 = modules["AGIv2"].dispatch(command_text)
+                await speak_async(reply_v2)
+
+        else:
+            await speak_async("Sorry, I didn’t understand that command.")
+
+    except Exception as e:
+        logging.error(f" Routing error: {e}")
+        await speak_async("Something went wrong executing your command.")
+
+# ---------------- MAIN LOOP ----------------
+async def wake_router():
+    await speak_async("Zynox is online. You can type commands or say 'Hey Zynox' to wake me up.")
+    session_active_until = 0
+
+    # Start calendar service
+    calendar_task = asyncio.create_task(modules["calendar"].main())
+
+    while True:
+        cmd_text = await listen_command(timeout=2)
+        now = asyncio.get_event_loop().time()
+
+        # Active session
+        if now < session_active_until and cmd_text:
+            await route_command(cmd_text)
+            session_active_until = now + SESSION_ACTIVE_SECONDS
+            continue
+
+        # Wake word + voice auth
+        if MIC_AVAILABLE and cmd_text and any(word in cmd_text for word in WAKE_WORDS):
+            logging.info(f"Wake word detected: {cmd_text}")
+            voice_sample = await record_voice()
+            if voice_sample and verify_owner_voice(voice_sample):
+                await speak_async("Yeah Zayn! Voice verified.")
+                session_active_until = now + SESSION_ACTIVE_SECONDS
+
+                while asyncio.get_event_loop().time() < session_active_until:
+                    command = await listen_command(timeout=2)
+                    if command:
+                        await route_command(command)
+                        session_active_until = asyncio.get_event_loop().time() + SESSION_ACTIVE_SECONDS
+
+        elif not MIC_AVAILABLE and cmd_text:
+            # Text-only mode
+            await route_command(cmd_text)
+
+# ---------------- RUN ----------------
+if __name__ == "__main__":
+    start_backend_services()
+    try:
+        asyncio.run(wake_router())
+    except KeyboardInterrupt:
+        logging.info("Shutting down Zynox full-stack router...")
