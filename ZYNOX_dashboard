@@ -1,0 +1,90 @@
+# zynox_dashboard
+import streamlit as st
+import datetime
+import pandas as pd
+import time
+import json
+import os
+from collections import Counter
+
+# --- DASHBOARD CONFIG ---
+st.set_page_config(page_title="Zynox AGI Dashboard v3", layout="wide")
+st.title(" Zynox AGI Dashboard v2")
+st.markdown("Real-time monitoring of Zynox's decision history and mood analysis.")
+
+# --- FILE PATH ---
+DATA_FILE_PATH = r"C:\zynox_agi\zynox_service.json"
+
+
+# --- DATA LOADING ---
+def load_data():
+    """Loads and processes data from the shared JSON file."""
+    if not os.path.exists(DATA_FILE_PATH):
+        st.error(f"Data file '{DATA_FILE_PATH}' not found. Please ensure the AGI system is running.")
+        return None, None, "No data available."
+    try:
+        with open(DATA_FILE_PATH, "r") as f:
+            data = json.load(f)
+            decision_history = data.get("decision_history", [])
+
+            if not decision_history:
+                return None, None, "No decisions recorded yet."
+
+            # Convert to DataFrame for easier analysis
+            df = pd.DataFrame(decision_history)
+
+            # --- Extract nested data ---
+            df['action'] = df['decision'].apply(lambda d: d.get('action', 'N/A'))
+            df['emotion'] = df['decision'].apply(
+                lambda d: d.get('explanation', 'N/A').split('high ')[-1].split("'")[0] if "high '" in d.get(
+                    'explanation', '') else 'neutral')
+            df['score'] = df['decision'].apply(lambda d: d.get('score', 0.0))
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+
+            return df, decision_history, "Data loaded successfully."
+    except Exception as e:
+        st.error(f"Error loading or parsing data: {e}")
+        return None, None, "Error processing data."
+
+
+# --- MAIN DASHBOARD LAYOUT ---
+df, decision_history, status_message = load_data()
+st.info(status_message)
+
+if df is not None:
+    # --- STATUS PANEL ---
+    status_col, trends_col = st.columns(2)
+    with status_col:
+        st.header(" Latest Decision")
+        latest_decision = df.iloc[-1]
+        st.markdown(f"**Action:** `{latest_decision['action']}`")
+        st.markdown(f"**Emotion:** `{latest_decision['emotion']}`")
+        st.markdown(f"**Explanation:** {latest_decision['decision']['explanation']}")
+        st.markdown(f"**Timestamp:** {latest_decision['timestamp'].strftime('%Y-%m-%d %H:%M:%S')}")
+
+    # --- TRENDS PANEL ---
+    with trends_col:
+        st.header(" Emotion & Decision Trends")
+        # Emotion trends
+        st.subheader("Emotion Score Over Time")
+        st.line_chart(df.set_index('timestamp')['score'])
+
+        # Decision frequency
+        st.subheader("Decision Frequency")
+        decision_counts = Counter(df['action'])
+        counts_df = pd.DataFrame(decision_counts.items(), columns=['Decision', 'Count'])
+        st.bar_chart(counts_df.set_index('Decision'))
+
+    # --- DECISION HISTORY PANEL ---
+    st.header(" Decision History (Last 10)")
+    st.dataframe(df[['timestamp', 'action', 'emotion', 'score', 'decision']].tail(10))
+
+    # --- RAW DATA VIEWER (for debugging) ---
+    st.header(" Raw Data")
+    st.json(decision_history)
+
+# --- REAL-TIME AUTO-REFRESH ---
+st.markdown("---")
+st.markdown("Dashboard refreshes automatically every 5 seconds.")
+time.sleep(5)
+st.rerun()
