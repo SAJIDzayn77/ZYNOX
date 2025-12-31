@@ -1,0 +1,331 @@
+# main
+import ast
+import json
+import os
+import sys
+from memory import Memory
+mem = Memory()
+
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List
+
+BANNER = r"""
+==============================
+   Z Y N O X   A G I   v0.1
+==============================
+Type /help for commands.
+"""
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+MEM_PATH = PROJECT_ROOT / "memory.json"
+
+# ---------- Simple persistent memory ----------
+def _load_mem() -> Dict[str, Any]:
+    if MEM_PATH.exists():
+        try:
+            return json.loads(MEM_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {"facts": [], "todos": []}
+
+def _save_mem(data: Dict[str, Any]) -> None:
+    MEM_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+MEM = _load_mem()
+
+# ---------- Safe math evaluator (AST) ----------
+_ALLOWED_BIN = (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Pow, ast.Mod, ast.FloorDiv)
+_ALLOWED_UNARY = (ast.UAdd, ast.USub)
+_ALLOWED_NODES = (ast.Expression, ast.BinOp, ast.UnaryOp, ast.Constant, ast.Load, ast.Pow, ast.Mod, ast.FloorDiv)
+
+
+def _eval_node(node: ast.AST) -> float:
+    if isinstance(node, ast.Num):  # py3.12 still provides ast.Num for literals
+        return node.n  # type: ignore[attr-defined]
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, _ALLOWED_UNARY):
+        val = _eval_node(node.operand)
+        return +val if isinstance(node.op, ast.UAdd) else -val
+    if isinstance(node, ast.BinOp) and isinstance(node.op, _ALLOWED_BIN):
+        left = _eval_node(node.left)
+        right = _eval_node(node.right)
+        if isinstance(node.op, ast.Add): return left + right
+        if isinstance(node.op, ast.Sub): return left - right
+        if isinstance(node.op, ast.Mult): return left * right
+        if isinstance(node.op, ast.Div): return left / right
+        if isinstance(node.op, ast.Mod): return left % right
+        if isinstance(node.op, ast.FloorDiv): return left // right
+        if isinstance(node.op, ast.Pow):
+            # guard: no huge exponents
+            if abs(left) > 1e6 or abs(right) > 10:
+                raise ValueError("Exponent too large")
+            return left ** right
+    raise ValueError("Unsupported expression.")
+
+def safe_calc(expr: str) -> float:
+    try:
+        tree = ast.parse(expr, mode="eval")
+        # quick security walk
+        for n in ast.walk(tree):
+            if isinstance(n, (ast.Call, ast.Attribute, ast.Subscript, ast.Name, ast.List, ast.Dict, ast.Tuple)):
+                raise ValueError("Only pure math is allowed.")
+        return _eval_node(tree.body)  # type: ignore[arg-type]
+    except Exception as e:
+        raise ValueError(f"Invalid math expression: {e}")
+
+# ---------- Utilities ----------
+def normalize_text(s: str) -> str:
+    return " ".join(s.strip().split())
+
+def summarize_text(text: str, max_sentences: int = 3) -> str:
+    # ultra-simple “summary”: take first N non-empty sentences
+    sentences = []
+    buff = ""
+    for ch in text:
+        buff += ch
+        if ch in ".!?":
+            sent = normalize_text(buff)
+            if sent:
+                sentences.append(sent)
+            buff = ""
+        if len(sentences) >= max_sentences:
+            break
+    if not sentences:
+        # fallback to first ~300 chars
+        return normalize_text(text[:300]) + ("..." if len(text) > 300 else "")
+    return " ".join(sentences[:max_sentences])
+
+def clear_screen() -> None:
+    os.system("cls" if os.name == "nt" else "clear")
+
+# ---------- “Agent” skills ----------
+def cmd_help(_: str = "") -> None:
+    print(
+        """
+Commands:
+/help                        Show this help
+/plan <goal>                 Make a step-by-step plan
+/calc <expr>                 Safe calculator, e.g. /calc (2+3)*4
+/remember <fact>             Store a fact in long-term memory
+/recall [n]                  Show last n facts (default 10)
+/todo add <item>             Add to todo list
+/todo list                   Show todos
+/todo done <index>           Mark todo completed (use the index from list)
+/read <path>                 Print the first lines of a text file
+/sum <path> [n]              Summarize file into n sentences (default 3)
+/time                        Current date & time
+/clear                       Clear the console
+/exit                        Quit
+"""
+    )
+
+def cmd_plan(arg: str) -> None:
+    goal = normalize_text(arg)
+    if not goal:
+        print("Give me a goal, e.g. /plan build a demo")
+        return
+    steps = generate_plan(goal)
+    print(f"Plan for: {goal}")
+    for i, s in enumerate(steps, 1):
+        print(f"{i}. {s}")
+
+def generate_plan(goal: str) -> List[str]:
+    g = goal.lower()
+    steps: List[str] = []
+    steps.append("Clarify success criteria and constraints (time, tools, inputs).")
+    steps.append("Break the goal into 3–6 concrete deliverables.")
+    if any(k in g for k in ["prototype", "demo", "app", "agent"]):
+        steps += [
+            "Set up project skeleton and versioned environment.",
+            "Implement a minimal end-to-end flow that runs locally.",
+            "Add one 'wow' feature that’s demo-friendly.",
+            "Test with 3 realistic scenarios and fix rough edges.",
+            "Prepare a 60–90s demo script and screenshots.",
+        ]
+    if any(k in g for k in ["report", "paper", "assignment"]):
+        steps += [
+            "Outline sections and key claims.",
+            "Collect supporting evidence and citations.",
+            "Draft -> review -> finalize visuals.",
+            "Proofread and export to PDF.",
+        ]
+    steps.append("Review against success criteria and iterate.")
+    return steps
+
+def cmd_calc(arg: str) -> None:
+    expr = arg.strip()
+    if not expr:
+        print("Usage: /calc <expression>")
+        return
+    try:
+        val = safe_calc(expr)
+        print(f"= {val}")
+    except Exception as e:
+        print(f"Calc error: {e}")
+
+def cmd_remember(arg: str) -> None:
+    fact = normalize_text(arg)
+    if not fact:
+        print("Usage: /remember <fact>")
+        return
+    MEM["facts"].append({"text": fact, "ts": time.time()})
+    _save_mem(MEM)
+    print("Saved to memory.")
+
+def cmd_recall(arg: str) -> None:
+    try:
+        n = int(arg.strip()) if arg.strip() else 10
+    except:
+        n = 10
+    facts = MEM.get("facts", [])[-n:]
+    if not facts:
+        print("No facts stored yet.")
+        return
+    for i, f in enumerate(facts, 1):
+        t = datetime.fromtimestamp(f["ts"]).strftime("%Y-%m-%d %H:%M")
+        print(f"{i}. [{t}] {f['text']}")
+
+def cmd_todo(arg: str) -> None:
+    parts = arg.strip().split(maxsplit=1)
+    if not parts:
+        print("Usage: /todo add <text> | /todo list | /todo done <index>")
+        return
+    action = parts[0].lower()
+    rest = parts[1] if len(parts) > 1 else ""
+    if action == "add":
+        item = normalize_text(rest)
+        if not item:
+            print("What should I add?")
+            return
+        MEM["todos"].append({"text": item, "done": False})
+        _save_mem(MEM)
+        print("Todo added.")
+    elif action == "list":
+        todos = MEM.get("todos", [])
+        if not todos:
+            print("Todo list is empty.")
+            return
+        for i, t in enumerate(todos, 1):
+            mark = "✔" if t["done"] else "•"
+            print(f"{i}. {mark} {t['text']}")
+    elif action == "done":
+        try:
+            idx = int(rest.strip())
+            todos = MEM.get("todos", [])
+            if 1 <= idx <= len(todos):
+                todos[idx - 1]["done"] = True
+                _save_mem(MEM)
+                print("Marked as done.")
+            else:
+                print("Invalid index.")
+        except:
+            print("Usage: /todo done <index>")
+    else:
+        print("Unknown /todo action. Use: add | list | done")
+
+def cmd_read(arg: str) -> None:
+    path = arg.strip().strip('"').strip("'")
+    if not path:
+        print("Usage: /read <path>")
+        return
+    p = (PROJECT_ROOT / path) if not os.path.isabs(path) else Path(path)
+    if not p.exists():
+        print(f"File not found: {p}")
+        return
+    try:
+        with p.open("r", encoding="utf-8", errors="ignore") as f:
+            head = f.read(1000)
+        print(f"--- {p.name} (preview) ---")
+        print(head)
+        print("----- end preview -----")
+    except Exception as e:
+        print(f"Read error: {e}")
+
+def cmd_sum(arg: str) -> None:
+    parts = arg.strip().split()
+    if not parts:
+        print("Usage: /sum <path> [sentences]")
+        return
+    path = parts[0].strip('"').strip("'")
+    try:
+        n = int(parts[1]) if len(parts) > 1 else 3
+    except:
+        n = 3
+    p = (PROJECT_ROOT / path) if not os.path.isabs(path) else Path(path)
+    if not p.exists():
+        print(f"File not found: {p}")
+        return
+    try:
+        text = p.read_text(encoding="utf-8", errors="ignore")
+        print(summarize_text(text, max_sentences=n))
+    except Exception as e:
+        print(f"Summarize error: {e}")
+
+def cmd_time(_: str) -> None:
+    print(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+def cmd_clear(_: str) -> None:
+    clear_screen()
+    print(BANNER)
+
+COMMANDS = {
+    "/help": cmd_help,
+    "/plan": cmd_plan,
+    "/calc": cmd_calc,
+    "/remember": cmd_remember,
+    "/recall": cmd_recall,
+    "/todo": cmd_todo,
+    "/read": cmd_read,
+    "/sum": cmd_sum,
+    "/time": cmd_time,
+    "/clear": cmd_clear,
+}
+
+def dispatch(line: str) -> bool:
+    line = line.strip()
+    if not line:
+        return True
+    if line.lower() in ("/exit", "/quit"):
+        return False
+    if line.split()[0].lower() in COMMANDS:
+        cmd = line.split()[0].lower()
+        arg = line[len(cmd):].strip()
+        try:
+            COMMANDS[cmd](arg)
+        except Exception as e:
+            print(f"Command error: {e}")
+    else:
+        # Default “assistant” reply: very light heuristic
+        reply = fallback_reply(line)
+        print(f"Zynox: {reply}")
+    return True
+
+def fallback_reply(user: str) -> str:
+    u = user.lower()
+    if any(k in u for k in ["calc", "math", "+", "-", "*", "/", "power", "pow", "**"]):
+        return "Try /calc <expression> — it’s a safe calculator."
+    if "plan" in u or "steps" in u or "how to" in u:
+        return "Use /plan <your goal> and I’ll draft a checklist."
+    if "remember" in u or "note" in u:
+        return "Use /remember <fact> to store a note, then /recall to view."
+    if "todo" in u:
+        return "Use /todo add <item>, /todo list, /todo done <index>."
+    if "file" in u or "read" in u or "summary" in u:
+        return "Use /read <path> to preview or /sum <path> to summarize."
+    return "Got it. Type /help to see everything I can do."
+
+def main() -> None:
+    print(BANNER)
+    while True:
+        try:
+            line = input("You: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nBye!")
+            break
+        if not dispatch(line):
+            print("Bye!")
+            break
+
+if __name__ == "__main__":
+    main()
