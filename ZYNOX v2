@@ -1,0 +1,386 @@
+
+import os, json, asyncio, threading, datetime, imaplib, smtplib, email, uuid, logging
+from collections import deque
+from cryptography.fernet import Fernet
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from functools import wraps, partial
+from dotenv import load_dotenv
+from plyer import notification
+import pyttsx3, speech_recognition as sr
+import chromadb
+import requests
+
+# ---------------- CONFIG ----------------
+load_dotenv()
+SERVICE_FILE = r"C:\zynox_agi\zynox_service1.json"
+CLOUD_MEMORY_FILE = r"C:\zynox_agi\zynox_cloud_encrypted.bin"
+
+EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS")
+APP_PASSWORD = os.getenv("APP_PASSWORD")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+PREFERRED_MIC_NAME = os.getenv("PREFERRED_MIC_NAME", None)
+
+USE_OPENAI = False
+USE_OPENROUTER = True
+OPENROUTER_MODEL = "deepseek/deepseek-chat-v3.1:free"
+
+LLM_MODEL = "gpt-4o"
+MOOD_HISTORY_SIZE = 15
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger("Zynox")
+
+# ---------------- ENCRYPTION ----------------
+with open(SERVICE_FILE, "r") as f:
+    service_data = json.load(f)
+ENCRYPTION_KEY = service_data["encryption_key"].encode()
+CIPHER_SUITE = Fernet(ENCRYPTION_KEY)
+
+# ---------------- HELPER DECORATOR ----------------
+def run_in_executor(func):
+    @wraps(func)
+    async def wrapper(*args, **kwargs):
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, partial(func, *args, **kwargs))
+    return wrapper
+
+# ---------------- MICROPHONE HELPER ----------------
+def list_microphones():
+    try:
+        return sr.Microphone.list_microphone_names()
+    except Exception as e:
+        logger.error(f"[Mic List Error] {e}")
+        return []
+
+def find_preferred_microphone(preferred_name: str = None):
+    names = list_microphones()
+    if not names:
+        return None
+    if preferred_name:
+        for i, n in enumerate(names):
+            if preferred_name.lower() in n.lower():
+                logger.info(f"Selected microphone by PREFERRED_MIC_NAME: {n} (index {i})")
+                return i
+    candidates = ["realtek", "microphone", "built-in", "built in", "internal", "array", "stereo mix", "wo mic"]
+    for cand in candidates:
+        for i, n in enumerate(names):
+            if cand in n.lower():
+                logger.info(f"Selected microphone by candidate '{cand}': {n} (index {i})")
+                return i
+    logger.info(f"No preferred microphone match. Using default: {names[0]} (index 0)")
+    return 0
+
+# ---------------- ZYNOX CALENDAR ----------------
+class ZynoxCalendar:
+    def __init__(self):
+        self._queue = asyncio.Queue()
+        self._file_lock = asyncio.Lock()
+
+    async def add_event(self, title, date, time_str, reminder="30 minutes before"):
+        async with self._file_lock:
+            if not os.path.exists(CLOUD_MEMORY_FILE):
+                data = {"events": []}
+            else:
+                with open(CLOUD_MEMORY_FILE, "rb") as f:
+                    data = json.loads(CIPHER_SUITE.decrypt(f.read()))
+            event = {"id": str(uuid.uuid4()), "title": title, "date": date, "time": time_str, "reminder": reminder}
+            data.setdefault("events", []).append(event)
+            with open(CLOUD_MEMORY_FILE, "wb") as f:
+                f.write(CIPHER_SUITE.encrypt(json.dumps(data, indent=2).encode()))
+            logging.info(f" Event added: {title} at {date} {time_str}")
+            return event
+
+    async def _get_upcoming_events(self):
+        async with self._file_lock:
+            if not os.path.exists(CLOUD_MEMORY_FILE):
+                return []
+            with open(CLOUD_MEMORY_FILE, "rb") as f:
+                data = json.loads(CIPHER_SUITE.decrypt(f.read()))
+            return data.get("events", [])
+
+    async def start_reminders(self):
+        while True:
+            events = await self._get_upcoming_events()
+            now = datetime.datetime.now()
+            for event in events:
+                try:
+                    event_time = datetime.datetime.strptime(f"{event['date']} {event['time']}", "%Y-%m-%d %H:%M")
+                except Exception:
+                    continue
+                reminder_minutes = int(event.get("reminder", "30 minutes before").split()[0])
+                reminder_time = event_time - datetime.timedelta(minutes=reminder_minutes)
+                if reminder_time <= now < reminder_time + datetime.timedelta(seconds=60):
+                    await self._queue.put(event)
+            await asyncio.sleep(10)
+
+    async def process_queue(self):
+        while True:
+            event = await self._queue.get()
+            msg = f"{event['title']} at {event['time']} ({event['date']})"
+            logging.info(f" Reminder: {msg}")
+            await asyncio.to_thread(lambda: notification.notify(title="Zynox Reminder", message=msg, timeout=10))
+            self._queue.task_done()
+
+# ---------------- TOOL REGISTRY ----------------
+class ActionToolRegistry:
+    def __init__(self, core):
+        self.core = core
+        self.tools = [
+            {"type": "function", "function": {"name": "send_email_reply", "description": "Sends an email reply.",
+                                              "parameters": {"type": "object", "properties": {"to": {"type": "string"},
+                                                                                              "subject": {"type": "string"},
+                                                                                              "body": {"type": "string"}},
+                                                             "required": ["to", "subject", "body"]}}},
+            {"type": "function", "function": {"name": "add_calendar_event", "description": "Adds a calendar event.",
+                                              "parameters": {"type": "object",
+                                                             "properties": {"title": {"type": "string"},
+                                                                            "date": {"type": "string"},
+                                                                            "time_str": {"type": "string"},
+                                                                            "reminder": {"type": "string"}},
+                                                             "required": ["title", "date", "time_str"]}}},
+            {"type": "function", "function": {"name": "get_current_time", "description": "Returns current system time.",
+                                              "parameters": {"type": "object", "properties": {} , "required": []}}}
+        ]
+
+    def get_tools(self):
+        return self.tools
+
+    async def execute_tool(self, tool_call: dict):
+        fname = tool_call["function"]["name"]
+        args = tool_call["function"].get("arguments", {})
+        if fname == "send_email_reply":
+            return await self._send_email(args["to"], args["subject"], args["body"])
+        elif fname == "add_calendar_event":
+            return await self.core.calendar.add_event(args["title"], args["date"], args["time_str"],
+                                                      args.get("reminder", "30 minutes before"))
+        elif fname == "get_current_time":
+            now = datetime.datetime.now()
+            msg = f"The current time is {now.strftime('%I:%M %p')}."
+            logging.info(f"[Zynox Reply] {msg}")
+            try:
+                self.core.engine.say(msg)
+                self.core.engine.runAndWait()
+            except Exception as e:
+                logging.error(f"[TTS Error] {e}")
+            return msg
+
+    async def _send_email(self, to, subject, body):
+        try:
+            msg = MIMEMultipart()
+            msg["From"] = EMAIL_ADDRESS
+            msg["To"] = to
+            msg["Subject"] = subject
+            msg.attach(MIMEText(body, "plain"))
+            server = smtplib.SMTP("smtp.gmail.com", 587)
+            server.starttls()
+            server.login(EMAIL_ADDRESS, APP_PASSWORD)
+            server.sendmail(EMAIL_ADDRESS, to, msg.as_string())
+            server.quit()
+            logging.info(f"📧 Email sent to {to}")
+        except Exception as e:
+            logging.error(f"[Send Email Error] {e}")
+
+# ---------------- LLM WRAPPER ----------------
+class ZynoxLLM:
+    def __init__(self):
+        self.use_openai = USE_OPENAI
+        self.use_openrouter = USE_OPENROUTER
+
+    async def generate(self, context: dict, memory: str, tools: list):
+        if self.use_openrouter:
+            try:
+                headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
+                payload = {
+                    "model": OPENROUTER_MODEL,
+                    "messages": [
+                        {"role": "system", "content": f"""
+You are Zynox, an AI assistant.
+Tools: {json.dumps(tools)}
+Memory:\n{memory}
+
+When you want to call a tool, output ONLY valid JSON like this:
+{{"function": {{"name": "tool_name", "arguments": {{ ... }}}}}}
+Never use XML or <invoke>. Always JSON.
+"""},
+                        {"role": "user", "content": str(context)}
+                    ],
+                    "temperature": 0.7
+                }
+                r = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload)
+                if r.status_code == 200:
+                    return {"content": r.json()["choices"][0]["message"]["content"]}
+                else:
+                    logging.error(f"OpenRouter API error {r.status_code}: {r.text}")
+                    return {"content": "Fallback: OpenRouter failed."}
+            except Exception as e:
+                logging.error(f"OpenRouter request exception: {e}")
+                return {"content": "Fallback: OpenRouter exception."}
+        else:
+            return {"content": "No LLM configured."}
+
+# ---------------- EMAIL & VOICE ----------------
+@run_in_executor
+def fetch_emails_sync():
+    try:
+        mail = imaplib.IMAP4_SSL("imap.gmail.com")
+        mail.login(EMAIL_ADDRESS, APP_PASSWORD)
+        mail.select("inbox")
+        status, msgs = mail.search(None, "UNSEEN")
+        new_emails = []
+        for num in msgs[0].split():
+            typ, data = mail.fetch(num, '(RFC822)')
+            msg = email.message_from_bytes(data[0][1])
+            body = ""
+            for part in msg.walk():
+                if part.get_content_type() == "text/plain":
+                    body += part.get_payload(decode=True).decode(errors='ignore') + "\n"
+            new_emails.append({"uid": num.decode(), "sender": msg.get("from", ""), "subject": msg.get("subject", ""), "body": body})
+        mail.close()
+        mail.logout()
+        return new_emails
+    except Exception as e:
+        logging.error(f"[Email Error] {e}")
+        return []
+
+@run_in_executor
+def listen_for_command_sync(recognizer, engine, device_index=None, timeout=7, phrase_time_limit=10):
+    try:
+        if device_index is None:
+            mic = sr.Microphone()
+        else:
+            mic = sr.Microphone(device_index=device_index)
+        with mic as source:
+            recognizer.adjust_for_ambient_noise(source, duration=0.5)
+            audio = recognizer.listen(source, timeout=timeout, phrase_time_limit=phrase_time_limit)
+        try:
+            return recognizer.recognize_google(audio)
+        except sr.UnknownValueError:
+            return None
+        except sr.RequestError as e:
+            logger.error(f"[STT Request Error] {e}")
+            return None
+    except Exception as e:
+        logger.error(f"[Mic Listen Error] {e}")
+        return None
+
+# ---------------- ZYNOX CORE ----------------
+class ZynoxCore:
+    def __init__(self):
+        self.planning_queue = asyncio.Queue()
+        self.action_queue = asyncio.Queue()
+        self.cipher_suite = CIPHER_SUITE
+        self.engine = pyttsx3.init()
+        self.recognizer = sr.Recognizer()
+        self.calendar = ZynoxCalendar()
+        self.llm = ZynoxLLM()
+        self.tool_registry = ActionToolRegistry(self)
+        self.tools = self.tool_registry.get_tools()
+        try:
+            self.memory_collection = chromadb.Client().get_or_create_collection("zynox_memories")
+        except Exception as e:
+            logger.warning(f"Chromadb init failed: {e}")
+            self.memory_collection = None
+        try:
+            self.mic_index = find_preferred_microphone(PREFERRED_MIC_NAME)
+        except Exception as e:
+            logger.error(f"Failed to find preferred mic: {e}")
+            self.mic_index = None
+        logger.info(f"Using microphone index: {self.mic_index}")
+
+# ---------------- AGENTS ----------------
+class PerceptionAgent:
+    def __init__(self, core: ZynoxCore):
+        self.core = core
+
+    async def run(self):
+        await asyncio.gather(
+            self.core.calendar.start_reminders(),
+            self.core.calendar.process_queue(),
+            self.check_loop()
+        )
+
+    async def check_loop(self):
+        while True:
+            await self.check_emails()
+            await self.check_voice()
+            await self.check_text()
+            await asyncio.sleep(0.25)
+
+    async def check_emails(self):
+        emails = await fetch_emails_sync()
+        for e in emails:
+            await self.core.planning_queue.put({"source": "email", "email": e})
+
+    async def check_voice(self):
+        voice_text = await listen_for_command_sync(self.core.recognizer, self.core.engine, device_index=self.core.mic_index)
+        if voice_text:
+            logger.info(f"[Voice Command] {voice_text}")
+            await self.core.planning_queue.put({"source": "voice", "text": voice_text})
+
+    async def check_text(self):
+        loop = asyncio.get_running_loop()
+        try:
+            text_input = await loop.run_in_executor(None, input, "Zynox (type 'exit' to quit): ")
+            if text_input and text_input.lower() == 'exit':
+                logging.info("Exiting Zynox.")
+                os._exit(0)
+            if text_input:
+                await self.core.planning_queue.put({"source": "text", "text": text_input})
+        except Exception:
+            pass
+
+class PlanningAgent:
+    def __init__(self, core: ZynoxCore):
+        self.core = core
+
+    async def run(self):
+        while True:
+            context = await self.core.planning_queue.get()
+            try:
+                response = await self.core.llm.generate(context, memory="", tools=self.core.tools)
+            except Exception as e:
+                logger.error(f"[LLM Generate Error] {e}")
+                response = {"content": "Fallback: LLM failed."}
+            if "function" in response.get("content", ""):
+                try:
+                    tool_call = json.loads(response["content"])
+                    await self.core.action_queue.put({"type": "tool_call", "tool_call": tool_call})
+                except Exception as e:
+                    logger.error(f"[Tool Parse Error] {e}")
+                    await self.core.action_queue.put({"type": "direct_response", "response": response["content"]})
+            else:
+                await self.core.action_queue.put({"type": "direct_response", "response": response["content"]})
+
+class ActionAgent:
+    def __init__(self, core: ZynoxCore):
+        self.core = core
+
+    async def run(self):
+        while True:
+            action = await self.core.action_queue.get()
+            try:
+                if action["type"] == "tool_call":
+                    await self.core.tool_registry.execute_tool(action["tool_call"])
+                elif action["type"] == "direct_response":
+                    reply = action["response"]
+                    logging.info(f"[Zynox Reply] {reply}")
+                    try:
+                        self.core.engine.say(reply)
+                        self.core.engine.runAndWait()
+                    except Exception as e:
+                        logging.error(f"[TTS Error] {e}")
+            except Exception as e:
+                logger.error(f"[ActionAgent Error] {e}")
+
+# ---------------- MAIN ----------------
+async def main():
+    core = ZynoxCore()
+    perception = PerceptionAgent(core)
+    planning = PlanningAgent(core)
+    action = ActionAgent(core)
+    logger.info("Zynox starting. Speak to it using the selected microphone.")
+    await asyncio.gather(perception.run(), planning.run(), action.run())
+
+if __name__ == "__main__":
+    asyncio.run(main())
