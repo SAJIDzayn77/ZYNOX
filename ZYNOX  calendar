@@ -1,0 +1,199 @@
+
+import asyncio
+import datetime
+import json
+import os
+import uuid
+import logging
+from typing import Dict, List, Optional
+from plyer import notification
+from cryptography.fernet import Fernet, InvalidToken
+
+# --- Settings ---
+SERVICE_FILE = r"C:\zynox_agi\zynox_service1.json"
+CLOUD_MEMORY_FILE = r"C:\zynox_agi\zynox_cloud_encrypted.bin"
+REMINDER_CHECK_INTERVAL = 60  # seconds
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+
+# --- Load encryption key ---
+try:
+    with open(SERVICE_FILE, "r") as f:
+        service_cfg = json.load(f)
+    ENCRYPTION_KEY = service_cfg.get("encryption_key")
+    if not ENCRYPTION_KEY:
+        raise ValueError("No encryption key found in service file")
+    FERNET = Fernet(ENCRYPTION_KEY.encode())
+except Exception as e:
+    logging.error(f"Failed to load encryption key: {e}")
+    raise
+
+# --- Async file lock for safe reads/writes ---
+file_lock = asyncio.Lock()
+
+async def read_memory() -> Dict:
+    async with file_lock:
+        if not os.path.exists(CLOUD_MEMORY_FILE):
+            return {"events": []}
+
+        def decrypt_file():
+            with open(CLOUD_MEMORY_FILE, "rb") as f:
+                encrypted = f.read()
+            return json.loads(FERNET.decrypt(encrypted).decode())
+
+        return await asyncio.to_thread(decrypt_file)
+
+async def write_memory(data: Dict):
+    async with file_lock:
+        def encrypt_file():
+            with open(CLOUD_MEMORY_FILE, "wb") as f:
+                encrypted = FERNET.encrypt(json.dumps(data).encode())
+                f.write(encrypted)
+        await asyncio.to_thread(encrypt_file)
+
+# --- Parse reminders ---
+def parse_reminder(reminder: str) -> int:
+    try:
+        parts = reminder.split()
+        if "min" in parts[1].lower():
+            return int(parts[0])
+        if "hour" in parts[1].lower():
+            return int(parts[0]) * 60
+    except Exception:
+        return 30
+    return 30
+
+# --- Calendar class ---
+class ZynoxCalendar:
+    def __init__(self):
+        self.queue = asyncio.Queue()
+        self.reminder_task: Optional[asyncio.Task] = None
+        self.worker_task: Optional[asyncio.Task] = None
+        self.loop_counter = 0
+
+    async def start(self):
+        if not os.path.exists(CLOUD_MEMORY_FILE):
+            await write_memory({"events": []})
+
+        self.reminder_task = asyncio.create_task(self.check_reminders())
+        self.worker_task = asyncio.create_task(self.reminder_worker())
+        logging.info("Calendar started.")
+
+    async def stop(self):
+        if self.reminder_task:
+            self.reminder_task.cancel()
+            await self.reminder_task
+        if self.worker_task:
+            await self.queue.join()
+            self.worker_task.cancel()
+            await self.worker_task
+        logging.info("Calendar stopped.")
+
+    async def check_reminders(self):
+        try:
+            while True:
+                self.loop_counter += 1
+                now = datetime.datetime.now()
+                data = await read_memory()
+                to_notify = []
+
+                for event in data.get("events", []):
+                    try:
+                        event_time = datetime.datetime.strptime(f"{event['date']} {event['time']}", "%Y-%m-%d %H:%M")
+                        reminder_minutes = parse_reminder(event.get("reminder", "30 minutes before"))
+                        reminder_time = event_time - datetime.timedelta(minutes=reminder_minutes)
+                        if reminder_time <= now < reminder_time + datetime.timedelta(seconds=REMINDER_CHECK_INTERVAL + 5):
+                            to_notify.append(event)
+                    except Exception:
+                        continue
+
+                for event in to_notify:
+                    print(f"[Heartbeat {self.loop_counter}] Queued: {event['title']}")
+                    await self.queue.put(event)
+
+                print(f"[Heartbeat {self.loop_counter}] Calendar alive at {now.strftime('%H:%M:%S')}")
+                next_check = self.next_check_interval(data.get("events", []), now)
+                await asyncio.sleep(next_check)
+
+        except asyncio.CancelledError:
+            logging.info("Reminder checker cancelled.")
+
+    async def reminder_worker(self):
+        try:
+            while True:
+                event = await self.queue.get()
+                await self.send_notification(event)
+                print(f"[Reminder sent] {event['title']}")
+                self.queue.task_done()
+        except asyncio.CancelledError:
+            logging.info("Reminder worker cancelled.")
+
+    def next_check_interval(self, events: List[Dict], now: datetime.datetime) -> int:
+        next_time = None
+        for event in events:
+            try:
+                event_time = datetime.datetime.strptime(f"{event['date']} {event['time']}", "%Y-%m-%d %H:%M")
+                reminder_minutes = parse_reminder(event.get("reminder", "30 minutes before"))
+                reminder_time = event_time - datetime.timedelta(minutes=reminder_minutes)
+                if reminder_time > now and (next_time is None or reminder_time < next_time):
+                    next_time = reminder_time
+            except Exception:
+                continue
+        if next_time:
+            return max(5, int((next_time - now).total_seconds()))
+        return REMINDER_CHECK_INTERVAL
+
+    async def add_event(self, title: str, date: str, time_str: str, reminder: str = "30 minutes before") -> Dict:
+        data = await read_memory()
+        event = {"id": str(uuid.uuid4()), "title": title, "date": date, "time": time_str, "reminder": reminder}
+        data.setdefault("events", []).append(event)
+        await write_memory(data)
+        logging.info(f"Event added: {title} on {date} at {time_str}")
+        return event
+
+    async def list_events(self) -> List[Dict]:
+        data = await read_memory()
+        return data.get("events", [])
+
+    async def delete_event(self, event_id: str) -> bool:
+        data = await read_memory()
+        original = len(data.get("events", []))
+        data["events"] = [e for e in data.get("events", []) if e["id"] != event_id]
+        if len(data["events"]) < original:
+            await write_memory(data)
+            logging.info(f"Event {event_id} deleted")
+            return True
+        logging.warning(f"Event {event_id} not found")
+        return False
+
+    async def send_notification(self, event: Dict):
+        msg = f"{event['title']} at {event['time']} ({event['date']})"
+        logging.info(f" {msg}")
+        def notify():
+            try:
+                notification.notify(title="Zynox Reminder", message=msg, timeout=10)
+            except Exception as e:
+                logging.error(f"Notification failed: {e}")
+        await asyncio.to_thread(notify)
+
+
+# --- Main ---
+async def main():
+    cal = ZynoxCalendar()
+    await cal.start()
+
+    now = datetime.datetime.now()
+    await cal.add_event("Demo Reminder", (now + datetime.timedelta(minutes=1)).strftime("%Y-%m-%d"),
+                        (now + datetime.timedelta(minutes=1)).strftime("%H:%M"), "1 minute before")
+
+    await cal.add_event("Future Event", "2025-12-25", "12:00", "1 hour before")
+
+    logging.info("Press Ctrl+C to stop.")
+    await asyncio.Future()  # Keep running
+
+if __name__ == "__main__":
+    asyncio.run(main())
