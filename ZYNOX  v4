@@ -1,0 +1,582 @@
+
+
+import argparse
+import json
+import logging
+import os
+import re
+from collections import Counter, defaultdict
+from datetime import datetime
+from dateutil import parser as dateparser
+
+# API and environment management
+from dotenv import load_dotenv
+RPAPI_KEY = os.getenv("SERPAPI_KEY")
+SERPAPI_URL = "https://serpapi.com/search"
+try:
+    from groq import Groq
+except ImportError:
+    Groq = None
+    logging.warning("Groq library not installed. AI synthesis will be skipped.")
+try:
+    from serpapi import GoogleSearch
+except ImportError:
+    GoogleSearch = None
+    logging.warning("SerpApi library not installed. Profile discovery will be skipped.")
+
+# Advanced NLP and Metrics
+import pandas as pd
+import numpy as np
+import requests
+from bs4 import BeautifulSoup
+from jinja2 import Template
+from sklearn.feature_extraction.text import TfidfVectorizer
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+import textstat
+import nltk
+nltk.download('stopwords')
+# Matplotlib is required for the heatmap visualization
+try:
+    import matplotlib.pyplot as plt
+except ImportError:
+    plt = None
+    logging.warning("Matplotlib not installed. Heatmap generation will be skipped.")
+
+from nltk.corpus import stopwords
+
+try:
+    nltk.download('stopwords', quiet=True)
+    STOPWORDS = set(stopwords.words('english'))
+except Exception:
+    STOPWORDS = set()
+
+# Stub out platform-specific libraries
+try:
+    import snscrape.modules.twitter as sntwitter
+except Exception:
+    sntwitter = None
+try:
+    import praw
+except Exception:
+    praw = None
+try:
+    import spacy
+
+    # Ensure this is loaded: python -m spacy download en_core_web_sm
+    nlp = spacy.load('en_core_web_sm')
+except Exception:
+    nlp = None
+
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+
+# --- Global Constants ---
+load_dotenv()
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+SERPAPI_API_KEY = os.getenv("SERPAPI_API_KEY")
+GROQ_MODEL = "llama-3.1-70b-versatile"
+
+# --- Emotion Lexicon (Simplified for demonstration) ---
+# In a real-world scenario, this would be a large, validated lexicon like LIWC.
+EMOTION_LEXICON = {
+    'anger': ['furious', 'hate', 'rage', 'idiot', 'damn', 'livid', 'fuming', 'outrage'],
+    'joy': ['happy', 'love', 'amazing', 'great', 'awesome', 'joyful', 'wonderful', 'excellent'],
+    'anxiety': ['worried', 'stress', 'fear', 'nervous', 'terrible', 'anxious', 'concerned', 'crisis'],
+    'sadness': ['sad', 'depressed', 'crying', 'unhappy', 'loss', 'mourn', 'grief', 'down']
+}
+
+
+# ----------------------------- Utilities -----------------------------
+
+def clean_text(t):
+    if not t: return ""
+    # Remove URLs
+    t = re.sub(r'http\S+', ' ', t)
+    t = re.sub(r'www\\.\S+', ' ', t)
+    # Remove mentions and hashtags
+    t = re.sub(r'@\w+', ' ', t)
+    t = re.sub(r'#', ' ', t)
+    # Remove non-alphanumeric characters, preserving spaces
+    t = re.sub(r'[^0-9A-Za-z\s]', ' ', t).strip()
+    return re.sub(r'\s+', ' ', t).strip().lower()
+
+
+def top_tfidf_keywords(docs, top_n=50):
+    """Calculates TF-IDF scores for identifying top keywords."""
+    if not docs: return []
+    # Using TfidfVectorizer with common English stopwords
+    vectorizer = TfidfVectorizer(stop_words=STOPWORDS, max_features=2000)
+    X = vectorizer.fit_transform(docs)
+    feature_names = vectorizer.get_feature_names_out()
+    # Average TF-IDF score across all documents
+    mean_tfidf = X.mean(axis=0).A1
+    pairs = list(zip(feature_names, mean_tfidf))
+    pairs.sort(key=lambda x: x[1], reverse=True)
+    return pairs[:top_n]
+
+
+def hour_weekday_matrix(timestamps):
+    """Creates a 7x24 matrix of post counts by weekday and hour."""
+    mat = np.zeros((7, 24), dtype=int)
+    for dt in timestamps:
+        if not isinstance(dt, datetime): continue
+        # dt.weekday() returns 0 (Monday) to 6 (Sunday)
+        mat[dt.weekday(), dt.hour] += 1
+    return mat
+
+
+def normalize_items(raw_items):
+    """Parses and cleans raw data items for analysis."""
+    items = []
+    for it in raw_items:
+        text = it.get('text') or ''
+        d = it.get('date')
+        dt = None
+        if d:
+            if isinstance(d, str):
+                try:
+                    dt = dateparser.parse(d)
+                except Exception:
+                    dt = None
+            elif isinstance(d, datetime):
+                dt = d
+        items.append({'id': it.get('id'), 'text': text, 'clean_text': clean_text(text), 'date': dt,
+                      'source': it.get('source', 'unknown')})
+    return items
+
+
+# ----------------------------- Profile Discovery (SerpApi) -----------------------------
+
+def find_social_profiles(person_name, max_results=20):
+    """Uses SerpApi to search for social media profiles of a person."""
+    if GoogleSearch is None or not SERPAPI_API_KEY:
+        logging.warning('SerpApi not configured; skipping automatic profile discovery.')
+        return {'x_handles': [], 'reddit_users': []}
+
+    query = f'{person_name} social media profiles'
+    logging.info(f'Searching for profiles for "{person_name}" via SerpApi...')
+    params = {"q": query, "api_key": SERPAPI_API_KEY, "num": max_results}
+    x_handles = set()
+    reddit_users = set()
+
+    try:
+        search = GoogleSearch(params)
+        results = search.get_dict()
+
+        for result in results.get('organic_results', []):
+            link = result.get('link', '').lower()
+            if 'twitter.com' in link or 'x.com' in link:
+                match = re.search(r'/(twitter|x)\.com/(\w+)', link)
+                if match:
+                    x_handles.add(match.group(2).lstrip('@'))
+            elif 'reddit.com/user/' in link:
+                match = re.search(r'reddit\.com/user/(\w+)', link)
+                if match:
+                    reddit_users.add(match.group(1))
+
+    except Exception as e:
+        logging.error(f'SerpApi error: {e}')
+
+    return {'x_handles': list(x_handles), 'reddit_users': list(reddit_users)}
+
+
+# ----------------------------- Fetchers (Stubs) -----------------------------
+# These functions require external platform-specific libraries (snscrape, praw).
+# They are stubbed to return empty lists if the library is not available.
+def fetch_x_tweets(handle, max_tweets=2000):
+    if sntwitter is None: logging.warning('snscrape not installed; skipping X.'); return []
+    return []
+
+
+def fetch_reddit_user(username, max_items=1000, praw_conf=None):
+    if praw is None or praw_conf is None: logging.warning('praw/config not installed; skipping reddit.'); return []
+    return []
+
+
+def fetch_public_webpage_text(url):
+    """Basic scraper to fetch and clean text from a public webpage."""
+    logging.info('Fetching public page: %s', url)
+    try:
+        r = requests.get(url, timeout=15, headers={'User-Agent': 'zynox-pro/1.0 (+contact)'})
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, 'html.parser')
+        # Remove common non-content elements
+        for s in soup(['script', 'style', 'noscript', 'header', 'footer', 'nav', 'aside']):
+            s.decompose()
+        text = ' '.join(soup.stripped_strings)
+        return {'id': url, 'text': text, 'date': None, 'source': 'web', 'url': url}
+    except Exception as e:
+        logging.error('Web fetch failed: %s', e)
+        return None
+
+
+# ----------------------------- Analysis (Deep Behavioral Profiling) -----------------------------
+
+def analyze_items(items, use_transformers=False, do_topic_clustering=False):
+    """Performs deep behavioral and psycholinguistic analysis on collected items."""
+    df = pd.DataFrame(items)
+    if df.empty: return {'error': 'no data'}
+
+    timestamps = [d for d in df['date'] if isinstance(d, datetime)]
+    heatmat = hour_weekday_matrix(timestamps)
+
+    # --- TIME ANALYSIS: Find the most active 4-hour block ---
+    hourly_counts = heatmat.sum(axis=0)
+    peak_activity_block = None
+    max_posts_in_block = -1
+
+    for start_hour in range(24):
+        # Calculate post count for the 4-hour block starting at start_hour
+        current_block_count = sum(hourly_counts[(start_hour + i) % 24] for i in range(4))
+        if current_block_count > max_posts_in_block:
+            max_posts_in_block = current_block_count
+            end_hour = (start_hour + 3) % 24
+            # Format the block (e.g., 09:00 - 13:00)
+            peak_activity_block = f"{start_hour:02d}:00 - {((end_hour + 1) % 24):02d}:00"
+
+    weekday_counts = heatmat.sum(axis=1)
+    day_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+    most_active_day_str = day_names[int(np.argmax(weekday_counts))] if weekday_counts.sum() > 0 else "N/A"
+
+    # --- ADVANCED LINGUISTIC/STYLMETRIC ANALYSIS ---
+    docs = df['clean_text'].astype(str).tolist()
+    raw_texts = df['text'].astype(str).tolist()
+
+    # 1. Average Words Per Post
+    word_counts = [len(t.split()) for t in docs if t]
+    avg_word_count = np.mean(word_counts) if word_counts else 0
+
+    # 2. Type-Token Ratio (Vocabulary Richness - TTR)
+    all_tokens = [token for doc in docs for token in doc.split() if token not in STOPWORDS]
+    # TTR = Unique Words / Total Words (measures lexical diversity)
+    ttr = len(set(all_tokens)) / len(all_tokens) if all_tokens else 0
+
+    # 3. Emotional Mix (using simple lexicon)
+    emotion_counts = defaultdict(int)
+    for text in docs:
+        for word in text.split():
+            for emotion, words in EMOTION_LEXICON.items():
+                if word in words:
+                    emotion_counts[emotion] += 1
+
+    total_emotion_words = sum(emotion_counts.values())
+    emotion_mix = {
+        k: (v / total_emotion_words) * 100 if total_emotion_words > 0 else 0
+        for k, v in emotion_counts.items()
+    }
+
+    # 4. Readability Score (Flesch Kincaid, uses raw text) - Lower score = easier to read
+    # Requires textstat dependency
+    fk_scores = [textstat.flesch_kincaid_grade(t) for t in raw_texts if t]
+    avg_readability = np.mean(fk_scores) if fk_scores else 0
+
+    # --- Rest of Analysis ---
+    tfidf_pairs = top_tfidf_keywords(docs, top_n=50)
+    top_keywords = [k for k, s in tfidf_pairs]
+
+    entities = defaultdict(Counter)
+    if nlp is not None:
+        # Named Entity Recognition (requires spaCy)
+        for idx, txt in enumerate(df['clean_text'].astype(str)):
+            doc = nlp(txt)
+            for ent in doc.ents:
+                entities[ent.label_][ent.text.lower()] += 1
+
+    sid = SentimentIntensityAnalyzer()
+    vader_scores = [sid.polarity_scores(t) for t in df['text'].astype(str)]
+    vader_df = pd.DataFrame(vader_scores)
+    vader_summary = vader_df.mean().to_dict() if not vader_df.empty else {}
+
+    source_stats = {src: len(g) for src, g in df.groupby('source')}
+
+    # --- ADVANCED SUMMARY OUTPUT ---
+    summary = {
+        'total_posts': len(df),
+        'peak_activity_block_4h': peak_activity_block,
+        'most_active_day': most_active_day_str,
+        'activity_heatmat': heatmat.tolist(),
+        'top_keywords': top_keywords,
+        'named_entities': {k: list(v.most_common(30)) for k, v in entities.items()},
+        'vader_sentiment': vader_summary,
+        'source_stats': source_stats,
+        # --- NEW ADVANCED METRICS ---
+        'avg_words_per_post': round(avg_word_count, 1),
+        'vocabulary_richness_ttr': round(ttr, 4),
+        'emotion_mix_percent': {k: round(v, 1) for k, v in emotion_mix.items()},
+        'avg_readability_score': round(avg_readability, 1)  # Flesch-Kincaid Grade Level
+    }
+    return summary
+
+
+# ----------------------------- AI Synthesis (Groq: Computational Behavioral Scientist) -----------------------------
+
+def synthesize_ai_report(person_name, summary):
+    """Uses the Groq API (Llama 3.1 70B) to generate a high-level narrative behavioral profile."""
+    if Groq is None or not GROQ_API_KEY:
+        return "AI synthesis skipped: Groq library or API key not available."
+
+    if summary.get('error'):
+        return f"AI synthesis skipped: No data collected for analysis ({summary['error']})."
+
+    logging.info(f'Generating AI synthesis report for {person_name} using {GROQ_MODEL}...')
+
+    # Prepare data for LLM prompt
+    keywords_str = ', '.join(summary.get('top_keywords', [])[:10])
+    vader_comp = summary.get('vader_sentiment', {}).get('compound', 'N/A')
+    active_block = summary.get('peak_activity_block_4h', 'N/A')
+    active_day = summary.get('most_active_day', 'N/A')
+
+    # NEW Advanced Metrics
+    avg_words = summary.get('avg_words_per_post', 'N/A')
+    ttr = summary.get('vocabulary_richness_ttr', 'N/A')
+    readability = summary.get('avg_readability_score', 'N/A')
+    emotion_mix = '; '.join([f'{k}: {v}%' for k, v in summary.get('emotion_mix_percent', {}).items()])
+
+    # --- ADVANCED SYSTEM PROMPT ---
+    system_prompt = f"""
+    You are Zynox-AI 2.0, a renowned **Computational Behavioral Scientist**. Your analysis must be deeper, focusing on synthesizing time, linguistic style, and emotional nuance into a cohesive psychological profile.
+    Infer subtle behavioral traits from the metrics. The final report must be professional, insightful, and structured exactly according to the user's three headings.
+
+    RAW DATA FOR ADVANCED INFERENCE:
+    - Total Posts Analyzed: {summary.get('total_posts')}
+    - Top 10 Keywords: {keywords_str}
+    - Peak Activity Block (4H): {active_block} on {active_day}
+    - Average Sentiment (VADER Compound): {vader_comp} (range -1.0 to 1.0)
+    - **Linguistic Style Metrics:**
+        - Average Words Per Post: {avg_words}
+        - Vocabulary Richness (TTR): {ttr} (Closer to 1.0 is richer)
+        - Readability Score (FK Grade): {readability} (Lower is easier, higher is more academic/complex)
+    - **Emotional Landscape:** {emotion_mix}
+    """
+
+    # --- ADVANCED USER QUERY to force psychological profiling ---
+    user_query = f"""
+    Generate a Zynox-AI Behavioral Profile for {person_name} based on the RAW DATA.
+
+    1.  **Temporal Profile (The Online Schedule):** Analyze the 4-hour peak activity block. Precisely categorize the time of day (e.g., 'Late Night', 'Business Hours') and infer the most probable **lifestyle context** for their posting activity (e.g., a dedicated work period, casual evening relaxation, or pre-work commute).
+    2.  **Psycholinguistic Persona (How They Communicate):** Analyze the Vocabulary Richness (TTR), Average Words Per Post, and Readability Score. Infer their dominant writing style (e.g., **'Complex/Formal'** or **'Direct/Casual'**). What does this suggest about their intended audience or cognitive complexity?
+    3.  **Core Behavioral Drivers (Emotional & Topic Focus):** Synthesize the keywords, sentiment, and the calculated **Emotion Mix**. Define the person's primary focus. Are they driven by **Advocacy/Controversy**, **Personal Life/Connection**, or **Information/Professionalism**? Describe the user's general **affective state** based on the emotion mix.
+    """
+
+    try:
+        client = Groq(api_key=GROQ_API_KEY)
+        chat_completion = client.chat.completions.create(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_query}
+            ],
+            model=GROQ_MODEL
+        )
+        return chat_completion.choices[0].message.content
+    except Exception as e:
+        logging.error(f'Groq API call failed: {e}')
+        return f"AI synthesis failed: {e}"
+
+
+# ----------------------------- Reporting -----------------------------
+
+def plot_heatmap(heatmat, out_png):
+    """Generates a visual heatmap of activity by hour and weekday."""
+    if plt is None:
+        logging.warning("Matplotlib is not available to generate the heatmap.")
+        return
+
+    arr = np.array(heatmat)
+    if arr.size == 0 or arr.sum() == 0: return
+
+    plt.figure(figsize=(12, 4))
+    # Using 'Blues' colormap for a professional look
+    cax = plt.imshow(arr, aspect='auto', cmap='Blues', interpolation='nearest')
+    plt.colorbar(cax, label='Post Count')
+    plt.xlabel('Hour (UTC)')
+    plt.ylabel('Weekday (0=Mon to 6=Sun)')
+    plt.title('Activity Heatmap (Weekday vs Hour)')
+    plt.xticks(np.arange(24))
+    plt.yticks(np.arange(7), ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"])
+    plt.tight_layout()
+    try:
+        plt.savefig(out_png)
+    except Exception as e:
+        logging.error(f"Failed to save heatmap: {e}")
+    finally:
+        plt.close()
+
+
+def generate_html_report(prefix, summary, ai_summary, items_sample):
+    """Generates a structured HTML report integrating analysis and AI synthesis."""
+    # This template is updated to reflect the new metrics in the summary section
+    tmpl = """
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <title>Zynox-AI 2.0 Behavioral Report</title>
+        <style>
+            body { font-family: Arial, sans-serif; line-height: 1.6; max-width: 1000px; margin: 0 auto; padding: 20px; background-color: #f4f7f9; }
+            h1, h2 { color: #004d99; border-bottom: 2px solid #004d99; padding-bottom: 5px; margin-top: 20px; }
+            .ai-summary { border: 3px solid #007bff; padding: 20px; background-color: #e6f3ff; border-radius: 8px; margin-bottom: 20px; }
+            ul { list-style-type: none; padding: 0; }
+            li { background-color: #ffffff; margin-bottom: 5px; padding: 8px; border-radius: 4px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+            pre { background-color: #eee; padding: 10px; border-radius: 4px; overflow-x: auto; }
+            .post-sample { border: 1px solid #ddd; margin: 8px 0; padding: 10px; background-color: #fff; border-radius: 4px; }
+            img { max-width: 100%; height: auto; display: block; margin: 15px 0; border: 1px solid #ccc; }
+        </style>
+    </head>
+    <body>
+    <h1>Zynox-AI 2.0 Behavioral Intelligence Report</h1>
+
+    <h2>🧠 AI-Synthesized Profile (Llama 3.1 70B)</h2>
+    <div class="ai-summary">
+        {{ ai_summary | safe }}
+    </div>
+
+    <h2>Advanced Summary Metrics</h2>
+    <ul>
+      <li>Total posts collected: <strong>{{ total_posts }}</strong></li>
+      <li>Most active time (4-hour block): <strong>{{ peak_activity_block_4h }}</strong> on <strong>{{ most_active_day }}</strong></li>
+      <li>VADER Compound Sentiment (Avg): <strong>{{ vader_sentiment.compound | round(3) }}</strong> (Closer to 1.0 is positive)</li>
+      <li>Average Words Per Post: <strong>{{ avg_words_per_post }}</strong></li>
+      <li>Vocabulary Richness (TTR): <strong>{{ vocabulary_richness_ttr }}</strong> (Closer to 1.0 is richer)</li>
+      <li>Readability (FK Grade Level): <strong>{{ avg_readability_score }}</strong> (Estimated grade level)</li>
+      <li>Emotional Mix (Top 3): 
+        {% for k,v in emotion_mix_percent.items() | sort(attribute='1', reverse=True) | slice(3) %} 
+        <strong>{{k | capitalize}}</strong>: {{v}}% 
+        {% endfor %}
+      </li>
+      <li>Per-source counts: 
+        {% for k,v in source_stats.items() %} 
+        <strong>{{k | capitalize}}</strong>: {{v}} 
+        {% endfor %}
+      </li>
+    </ul>
+
+    <h2>Top Keywords (TF-IDF Weighted)</h2>
+    <p>{{ top_keywords }}</p>
+
+    <h2>Named Entities (Top Organizations/People)</h2>
+    <pre>Organizations: {{ named_entities.ORG | default('N/A') }}</pre>
+    <pre>People: {{ named_entities.PERSON | default('N/A') }}</pre>
+
+    {% if heatmap_png %}
+    <h2>Activity Heatmap</h2>
+    <img src="{{ heatmap_png }}" alt="Activity Heatmap by Hour and Weekday">
+    {% endif %}
+
+    <h2>Sample Posts (Latest 30)</h2>
+    {% for it in items %}
+      <div class="post-sample"><small><strong>{{it.source | capitalize}}</strong> - {{it.date}}</small><p>{{it.text}}</p></div>
+    {% endfor %}
+    </body>
+    </html>
+    """
+
+    # Safely convert AI summary for HTML output
+    safe_ai_summary = ai_summary.replace('\n', '<br>')
+
+    html = Template(tmpl).render(
+        ai_summary=safe_ai_summary,
+        total_posts=summary.get('total_posts'),
+        peak_activity_block_4h=summary.get('peak_activity_block_4h'),
+        most_active_day=summary.get('most_active_day'),
+        vader_sentiment=summary.get('vader_sentiment'),
+        avg_words_per_post=summary.get('avg_words_per_post'),
+        vocabulary_richness_ttr=summary.get('vocabulary_richness_ttr'),
+        avg_readability_score=summary.get('avg_readability_score'),
+        emotion_mix_percent=summary.get('emotion_mix_percent'),
+        source_stats=summary.get('source_stats'),
+        top_keywords=', '.join(summary.get('top_keywords', [])[:50]),
+        named_entities=summary.get('named_entities'),
+        # Only include heatmap source if matplotlib was available
+        heatmap_png=os.path.basename(prefix + '_heatmap.png') if plt is not None else None,
+        items=items_sample[:30]
+    )
+    out_html = prefix + '.html'
+    with open(out_html, 'w', encoding='utf-8') as f:
+        f.write(html)
+    return out_html
+
+
+# ----------------------------- CLI / Orchestration -----------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description='Zynox-AI 2.0 Intelligence Engine (Deep Behavioral Profiling)')
+
+    parser.add_argument('target_name',
+                        help='The full name of the person/entity to search and profile (e.g., "Elon Musk")')
+    parser.add_argument('--x-handle', action='append', default=[],
+                        help='Manually specify an X handle (overrides search for X)')
+    parser.add_argument('--reddit-user', action='append', default=[],
+                        help='Manually specify a Reddit user (overrides search for Reddit)')
+    parser.add_argument('--web-url', action='append', default=[],
+                        help='Manually specify a public webpage URL to scrape')
+    parser.add_argument('--max-items', type=int, default=2000, help='Maximum number of items to collect per source.')
+    parser.add_argument('--consent', action='store_true', help='MUST be provided to confirm consent/public data usage.')
+    parser.add_argument('--output', default='zynox_ai_report_v2',
+                        help='Output file prefix (e.g., "report" outputs report.html, report.json, report_heatmap.png).')
+    # These flags are placeholders for future model enhancements
+    parser.add_argument('--use-transformers', action='store_true',
+                        help='Placeholder: Use transformer models for advanced embedding.')
+    parser.add_argument('--do-topic-clustering', action='store_true',
+                        help='Placeholder: Perform unsupervised topic modeling.')
+    args = parser.parse_args()
+
+    if not args.consent:
+        print('You must supply --consent to confirm you have permission or that the data is public. Exiting.')
+        return
+
+    # 1. Profile Discovery
+    discovered_profiles = find_social_profiles(args.target_name)
+    all_x_handles = set(args.x_handle) | set(discovered_profiles['x_handles'])
+    all_reddit_users = set(args.reddit_user) | set(discovered_profiles['reddit_users'])
+    raw_items = []
+
+    # 2. Data Collection (Stubs used if libraries/keys are missing)
+    for handle in all_x_handles:
+        raw_items.extend(fetch_x_tweets(handle, max_tweets=args.max_items))
+    for user in all_reddit_users:
+        raw_items.extend(fetch_reddit_user(user, max_items=args.max_items, praw_conf=None))
+    for url in args.web_url:
+        item = fetch_public_webpage_text(url)
+        if item: raw_items.append(item)
+
+    if not raw_items:
+        logging.error('No items fetched. Exiting.')
+        return
+
+    # 3. Analysis (Includes deep psycholinguistic features)
+    items = normalize_items(raw_items)
+    summary = analyze_items(items, use_transformers=args.use_transformers, do_topic_clustering=args.do_topic_clustering)
+
+    # 4. AI Synthesis (Uses the advanced prompt)
+    ai_summary = synthesize_ai_report(args.target_name, summary)
+
+    # 5. Reporting
+    out_json = args.output + '.json'
+    report_data = {'fetched_at': datetime.utcnow().isoformat() + 'Z', 'target': args.target_name,
+                   'items_count': len(items), 'summary': summary, 'ai_summary_raw': ai_summary}
+    with open(out_json, 'w', encoding='utf-8') as f:
+        json.dump(report_data, f, ensure_ascii=False, indent=2, default=str)
+
+    # Plotting (conditional on matplotlib import)
+    heat_png = args.output + '_heatmap.png'
+    plot_heatmap(summary.get('activity_heatmat', []), heat_png)
+
+    items_sample = sorted(items, key=lambda x: x.get('date') or datetime(1970, 1, 1), reverse=True)
+    out_html = generate_html_report(args.output, summary, ai_summary, items_sample)
+
+    print('\n--- Zynox-AI 2.0 Behavioral Report ---')
+    print(f'Target: {args.target_name}')
+    print('JSON summary:', out_json)
+    print('HTML report:', out_html)
+    print('--- AI SYNTHESIS (Llama 3.1) ---')
+    print(ai_summary)
+    print('-----------------------------------------')
+
+
+if __name__ == '__main__':
+    # Initial checks for required API keys
+    if not GROQ_API_KEY:
+        logging.error("GROQ_API_KEY is missing. Please set it in your .env file.")
+    if not SERPAPI_API_KEY:
+        logging.error("SERPAPI_API_KEY is missing. Please set it in your .env file.")
+
+    # main()
+    pass
